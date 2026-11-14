@@ -1,0 +1,50 @@
+# =============================================================================
+# Projet 7 – CA intermédiaire (en ligne)
+# Signe les certificats serveurs (TLS) présentés par HAProxy.
+# =============================================================================
+[ ca ]
+default_ca = CA_intermediate
+
+[ CA_intermediate ]
+dir               = $ENV::PKI_DIR/intermediate
+certs             = $dir/certs
+new_certs_dir     = $dir/newcerts
+database          = $dir/db/index.txt
+serial            = $dir/db/serial
+crlnumber         = $dir/db/crlnumber
+private_key       = $dir/private/intermediate.key
+certificate       = $dir/certs/intermediate.crt
+crl               = $dir/crl/intermediate.crl
+default_md        = sha256
+default_days      = 397
+default_crl_days  = 30
+preserve          = no
+unique_subject    = no
+# Les SAN viennent de la config (variable SAN), jamais de la CSR
+copy_extensions   = none
+policy            = policy_server
+
+[ policy_server ]
+organizationName       = optional
+organizationalUnitName = optional
+commonName             = supplied
+
+[ req ]
+default_md          = sha256
+distinguished_name  = req_dn
+string_mask         = utf8only
+prompt              = no
+
+[ req_dn ]
+O  = Projet7 HA
+OU = PKI interne
+CN = Projet7 Intermediate CA
+
+# Certificat serveur TLS
+[ server_cert ]
+basicConstraints       = critical, CA:false
+keyUsage               = critical, digitalSignature
+extendedKeyUsage       = serverAuth
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid, issuer
+subjectAltName         = $ENV::SAN

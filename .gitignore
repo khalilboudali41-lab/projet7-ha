@@ -14,3 +14,8 @@ backups/
 # Divers
 *.log
 tests/results/*.tmp
+# PKI : phrases de passe, archives hors ligne, PEM HAProxy (contient la clé)
+*.pass
+*.enc
+pki/offline/
+haproxy.pem
