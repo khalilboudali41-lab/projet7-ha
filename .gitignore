@@ -1,0 +1,16 @@
+# Secrets
+.env
+*.env.local
+# PKI : clés privées jamais versionnées
+pki/**/private/
+*.key
+*.p12
+*.pfx
+# Sauvegardes base de données
+backups/
+*.sql
+*.sql.gz
+*.mbstream
+# Divers
+*.log
+tests/results/*.tmp
