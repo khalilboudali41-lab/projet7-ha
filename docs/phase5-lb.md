@@ -47,7 +47,7 @@
 | Rate limiting | stick-table par IP : > 100 requêtes / 10 s ou > 30 connexions simultanées → 429 |
 | Répartition | `leastconn`, check `GET /healthz` toutes les 2 s (2 échecs → DOWN), `observe layer7`, `redispatch` |
 | Sticky sessions | non nécessaires (application sans état) – directive `cookie` documentée en commentaire |
-| Stats | `https://www.projet7.local:8404/stats`, LAN 192.168.89.0/24 uniquement, utilisateur + empreinte SHA-512 (userlist hors image, dans `/run/secrets`) |
+| Stats | `https://www.projet7.local:8404/stats`, poste d'administration 192.168.89.1 uniquement (403 sinon), utilisateur + empreinte SHA-512 (userlist hors image, dans `/run/secrets`) |
 | VRRP | unicast, auth PASS, 2 nœuds BACKUP prio 150/100, `preempt_delay 10`, `track_script` (HAProxy répond **et** au moins 1 serveur web UP) |
 | Conteneur | HAProxy non-root (uid 99) via su-exec ; keepalived root avec `NET_ADMIN`, `NET_RAW` ; rootfs read-only ; sysctls de namespace `ip_nonlocal_bind=1`, `ip_unprivileged_port_start=0` ; superviseur : la mort d'un processus arrête le conteneur (VIP libérée) |
 | Journaux | HAProxy → syslog UDP (log_net) ; tous les autres conteneurs → pilote Docker `syslog` (127.0.0.1:5514) ; `./logs/<conteneur>.log` + `all.log` ; `docker logs` toujours disponible |
