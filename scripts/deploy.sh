@@ -5,6 +5,7 @@
 #   scripts/deploy.sh init-env   # crée .env (600) depuis .env.example, mots de passe aléatoires
 #   scripts/deploy.sh secrets    # exporte les secrets de .env vers secrets/ (700, SELinux)
 #   scripts/deploy.sh db         # tier données : Galera (bootstrap intelligent) + dbproxy + backup
+#   scripts/deploy.sh web        # tiers app (php-fpm ×3) + web (nginx ×3)
 #   scripts/deploy.sh all        # toutes les étapes disponibles
 #   scripts/deploy.sh status     # état des conteneurs et du cluster
 #   scripts/deploy.sh down       # arrête tout (les volumes/données sont CONSERVÉS)
@@ -134,6 +135,17 @@ deploy_db() {
 }
 
 # -----------------------------------------------------------------------------
+deploy_web() {
+  render_secrets
+  log "Construction de l'image applicative"
+  compose build -q app1
+  compose up -d app1 app2 app3
+  for n in app1 app2 app3; do wait_healthy "$n" 60; done
+  compose up -d web1 web2 web3
+  for n in web1 web2 web3; do wait_healthy "$n" 60; done
+}
+
+# -----------------------------------------------------------------------------
 status_db() {
   log "Cluster Galera"
   local n
@@ -158,7 +170,8 @@ case "${1:-}" in
   init-env) init_env ;;
   secrets)  render_secrets ;;
   db)       deploy_db ;;
-  all)      init_env; deploy_db ;;
+  web)      deploy_web ;;
+  all)      init_env; deploy_db; deploy_web ;;
   status)   status ;;
   down)     compose down; ok "Arrêté (volumes conservés : docker volume ls | grep projet7)" ;;
   *)        sed -n '3,12p' "$0"; exit 1 ;;
