@@ -43,9 +43,11 @@ galera_state() {   # → "Synced Primary 3"  (ou "DOWN")
   galera_q "$1" "SELECT GROUP_CONCAT(VARIABLE_VALUE ORDER BY FIELD(VARIABLE_NAME,'WSREP_LOCAL_STATE_COMMENT','WSREP_CLUSTER_STATUS','WSREP_CLUSTER_SIZE') SEPARATOR ' ') FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME IN ('WSREP_LOCAL_STATE_COMMENT','WSREP_CLUSTER_STATUS','WSREP_CLUSTER_SIZE')" 2>/dev/null || echo DOWN
 }
 
-# Requête SQL applicative à travers dbproxy (chemin réel de l'application)
+# Requête SQL applicative à travers dbproxy (chemin réel de l'application) ;
+# APP_SQL_HOST=galeraN pour interroger un nœud précis (compte applicatif, moindre privilège)
 app_sql() {
   docker run --rm -i --network projet7_db_net --security-opt no-new-privileges:true --cap-drop ALL \
     -v "$P7_ROOT/secrets/db_app_password:/run/secrets/pw:ro" \
-    --entrypoint bash "$GALERA_IMAGE" -c 'MYSQL_PWD=$(< /run/secrets/pw) exec mariadb --no-defaults --skip-ssl -h db -u vitrine vitrine -N -B "$@"' _ "$@"
+    -e "DBHOST=${APP_SQL_HOST:-db}" \
+    --entrypoint bash "$GALERA_IMAGE" -c 'MYSQL_PWD=$(< /run/secrets/pw) exec mariadb --no-defaults --skip-ssl -h "$DBHOST" -u vitrine vitrine -N -B "$@"' _ "$@"
 }

@@ -15,7 +15,7 @@ backups/
 !db/initdb/*.sql
 # Divers
 *.log
-tests/results/*.tmp
+tests/results/
 # PKI : phrases de passe, archives hors ligne, PEM HAProxy (contient la clé)
 *.pass
 *.enc

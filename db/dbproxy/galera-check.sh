@@ -7,7 +7,7 @@
 # =============================================================================
 PW=$(cat /run/secrets/db_monitor_password) || exit 2
 out=$(MYSQL_PWD="$PW" mariadb --no-defaults --skip-ssl -h "$3" -P "$4" -u monitor \
-        --connect-timeout=2 -N -B -e \
+        --connect-timeout=1 -N -B -e \
         "SHOW GLOBAL STATUS WHERE Variable_name IN ('wsrep_local_state','wsrep_cluster_status','wsrep_ready')" 2>/dev/null) || exit 1
 echo "$out" | grep -q "^wsrep_local_state	4$"        || exit 1
 echo "$out" | grep -q "^wsrep_cluster_status	Primary$" || exit 1

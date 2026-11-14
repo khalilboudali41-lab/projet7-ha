@@ -145,7 +145,7 @@ deploy_db() {
   log "Construction de l'image dbproxy"
   compose build -q dbproxy1
   galera_up
-  rolling dbproxy1 dbproxy2
+  ROLL_OPTS=--force-recreate rolling dbproxy1 dbproxy2   # haproxy.cfg monté (cf. deploy_web)
   compose up -d --no-deps backup
   status_db
 }
@@ -156,11 +156,13 @@ deploy_web() {
   log "Construction de l'image applicative"
   compose build -q app1
   rolling app1 app2 app3
-  rolling web1 web2 web3
+  # nginx.conf est monté (bind mount de fichier) : un éditeur qui remplace le fichier
+  # (nouvel inode) n'est pas vu par le conteneur → recréation systématique, un par un
+  ROLL_OPTS=--force-recreate rolling web1 web2 web3
 }
 
 # Mise à jour sans interruption : un conteneur à la fois, en attendant qu'il soit sain
-rolling() { local n; for n in "$@"; do compose up -d --no-deps "$n"; wait_healthy "$n" 120; done; }
+rolling() { local n; for n in "$@"; do compose up -d --no-deps ${ROLL_OPTS:-} "$n"; wait_healthy "$n" 120; done; }
 
 # -----------------------------------------------------------------------------
 deploy_lb() {
