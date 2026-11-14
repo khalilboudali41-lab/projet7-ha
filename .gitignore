@@ -11,6 +11,8 @@ backups/
 *.sql
 *.sql.gz
 *.mbstream
+# … sauf les scripts d'initialisation du schéma
+!db/initdb/*.sql
 # Divers
 *.log
 tests/results/*.tmp
@@ -19,3 +21,5 @@ tests/results/*.tmp
 *.enc
 pki/offline/
 haproxy.pem
+# Secrets générés à partir de .env par scripts/deploy.sh
+secrets/

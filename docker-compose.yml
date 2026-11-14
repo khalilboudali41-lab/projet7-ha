@@ -1,0 +1,176 @@
+# =============================================================================
+# Projet 7 – Architecture N-tiers haute disponibilité
+#   LB (HAProxy ×2 + Keepalived/VIP) → Web (nginx ×3) → App (php-fpm ×3)
+#   → dbproxy (HAProxy ×2) → MariaDB Galera ×3
+# Déploiement : scripts/deploy.sh (gère .env, secrets et bootstrap Galera)
+# =============================================================================
+name: projet7
+
+# --- Durcissement commun ------------------------------------------------------
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "5", tag: "{{.Name}}" }
+
+# --- Nœud Galera (modèle) -----------------------------------------------------
+x-galera: &galera
+  <<: *hardening
+  image: mariadb:11.4.13-noble
+  entrypoint: ["/usr/local/bin/galera-entrypoint.sh"]
+  # L'entrypoint officiel démarre en root puis bascule sur l'utilisateur mysql
+  # (gosu) : seules les capacités nécessaires à cette bascule sont rendues.
+  cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+  environment:
+    MARIADB_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+    MARIADB_ROOT_HOST: localhost          # pas de root à distance
+    TZ: ${TZ:-Europe/Paris}
+  secrets: [db_root_password, db_sst_password, db_monitor_password, db_app_password, db_backup_password]
+  healthcheck:
+    test: ["CMD", "healthcheck.sh", "--defaults-extra-file=/etc/mysql/healthcheck-auth.cnf", "--connect", "--galera_online"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 180s                    # temps d'un SST complet
+  stop_grace_period: 60s                  # arrêt propre → grastate.dat cohérent
+  mem_limit: 512m
+
+services:
+  # ===========================================================================
+  # Tier données
+  # ===========================================================================
+  galera1:
+    <<: *galera
+    container_name: galera1
+    hostname: galera1
+    command: ["mariadbd", "--wsrep_node_name=galera1", "--wsrep_node_address=172.30.30.11"]
+    environment:
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+      MARIADB_ROOT_HOST: localhost
+      TZ: ${TZ:-Europe/Paris}
+      GALERA_BOOTSTRAP: ${GALERA1_BOOTSTRAP:-0}
+    volumes:
+      - galera1_data:/var/lib/mysql
+      - ./db/conf/galera.cnf:/etc/mysql/conf.d/60-projet7-galera.cnf:ro,z
+      - ./db/galera-entrypoint.sh:/usr/local/bin/galera-entrypoint.sh:ro,z
+      # Scripts d'initialisation : exécutés uniquement si le datadir est vide
+      - ./db/initdb:/docker-entrypoint-initdb.d:ro,z
+    networks:
+      db_net: { ipv4_address: 172.30.30.11 }
+
+  galera2:
+    <<: *galera
+    container_name: galera2
+    hostname: galera2
+    command: ["mariadbd", "--wsrep_node_name=galera2", "--wsrep_node_address=172.30.30.12"]
+    environment:
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+      MARIADB_ROOT_HOST: localhost
+      TZ: ${TZ:-Europe/Paris}
+      GALERA_BOOTSTRAP: ${GALERA2_BOOTSTRAP:-0}
+    volumes:
+      - galera2_data:/var/lib/mysql
+      - ./db/conf/galera.cnf:/etc/mysql/conf.d/60-projet7-galera.cnf:ro,z
+      - ./db/galera-entrypoint.sh:/usr/local/bin/galera-entrypoint.sh:ro,z
+    networks:
+      db_net: { ipv4_address: 172.30.30.12 }
+
+  galera3:
+    <<: *galera
+    container_name: galera3
+    hostname: galera3
+    command: ["mariadbd", "--wsrep_node_name=galera3", "--wsrep_node_address=172.30.30.13"]
+    environment:
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+      MARIADB_ROOT_HOST: localhost
+      TZ: ${TZ:-Europe/Paris}
+      GALERA_BOOTSTRAP: ${GALERA3_BOOTSTRAP:-0}
+    volumes:
+      - galera3_data:/var/lib/mysql
+      - ./db/conf/galera.cnf:/etc/mysql/conf.d/60-projet7-galera.cnf:ro,z
+      - ./db/galera-entrypoint.sh:/usr/local/bin/galera-entrypoint.sh:ro,z
+    networks:
+      db_net: { ipv4_address: 172.30.30.13 }
+
+  # --- Proxy SQL interne (×2, alias DNS « db ») -------------------------------
+  dbproxy1: &dbproxy
+    <<: *hardening
+    build: ./db/dbproxy
+    image: projet7/dbproxy:3.2.26
+    container_name: dbproxy1
+    hostname: dbproxy1
+    read_only: true
+    tmpfs: ["/tmp:size=8m"]
+    secrets: [db_monitor_password]
+    volumes:
+      - ./db/dbproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro,z
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'show info' | socat stdio unix-connect:/tmp/admin.sock | grep -q '^Uptime:'"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    mem_limit: 64m
+    networks:
+      db_net:
+        ipv4_address: 172.30.30.21
+        aliases: [db]
+
+  dbproxy2:
+    <<: *dbproxy
+    container_name: dbproxy2
+    hostname: dbproxy2
+    networks:
+      db_net:
+        ipv4_address: 172.30.30.22
+        aliases: [db]
+
+  # --- Sauvegarde logique planifiée -------------------------------------------
+  backup:
+    <<: *hardening
+    image: mariadb:11.4.13-noble
+    container_name: db-backup
+    hostname: db-backup
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"   # fichiers de sauvegarde appartenant à l'utilisateur hôte
+    entrypoint: ["/usr/local/bin/backup.sh", "loop"]
+    read_only: true
+    tmpfs: ["/tmp:size=16m"]
+    environment:
+      TZ: ${TZ:-Europe/Paris}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-21600}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
+    secrets: [db_backup_password]
+    volumes:
+      - ./db/backup/backup.sh:/usr/local/bin/backup.sh:ro,z
+      - ./backups:/backups:Z
+    mem_limit: 128m
+    networks:
+      db_net: { ipv4_address: 172.30.30.31 }
+
+# =============================================================================
+networks:
+  # Tier données : interne (aucune route vers l'extérieur, aucun port publié)
+  db_net:
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: br-p7-db
+      # Aucune IP côté hôte sur ce bridge : la base est injoignable même depuis la VM
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    ipam:
+      config: [{ subnet: 172.30.30.0/24 }]
+
+volumes:
+  galera1_data:
+  galera2_data:
+  galera3_data:
+
+# Secrets : fichiers générés depuis .env par scripts/deploy.sh (secrets/ en 700,
+# label SELinux container_file_t), montés en lecture seule dans /run/secrets.
+secrets:
+  db_root_password:    { file: ./secrets/db_root_password }
+  db_sst_password:     { file: ./secrets/db_sst_password }
+  db_monitor_password: { file: ./secrets/db_monitor_password }
+  db_app_password:     { file: ./secrets/db_app_password }
+  db_backup_password:  { file: ./secrets/db_backup_password }

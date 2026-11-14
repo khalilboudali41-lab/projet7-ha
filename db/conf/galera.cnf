@@ -1,0 +1,40 @@
+# =============================================================================
+# Projet 7 – MariaDB Galera (commun aux 3 nœuds)
+# Les paramètres propres à chaque nœud (nom, adresse) sont passés en ligne de
+# commande par docker-compose.yml ; wsrep_sst_auth est généré au démarrage à
+# partir de /run/secrets (db/galera-entrypoint.sh).
+# =============================================================================
+[mysqld]
+# --- Réseau / sécurité ---
+bind-address            = 0.0.0.0
+skip-name-resolve       = ON
+local-infile            = OFF
+max_connections         = 200
+max_connect_errors      = 10000
+
+# --- Prérequis Galera ---
+binlog_format                = ROW
+default_storage_engine       = InnoDB
+innodb_autoinc_lock_mode     = 2
+# Galera exige une clé primaire sur chaque table (certification des écritures)
+innodb_force_primary_key     = ON
+innodb_flush_log_at_trx_commit = 1
+
+# --- Empreinte mémoire réduite (VM unique, 3 nœuds) ---
+innodb_buffer_pool_size = 128M
+innodb_log_file_size    = 64M
+performance_schema      = OFF
+character-set-server    = utf8mb4
+# collation par défaut de MariaDB 11.4 (utf8mb4_uca1400_ai_ci), identique aux tables système
+
+# --- Réplication synchrone Galera ---
+wsrep_on                 = ON
+wsrep_provider           = /usr/lib/galera/libgalera_smm.so
+wsrep_cluster_name       = projet7_galera
+wsrep_cluster_address    = gcomm://172.30.30.11,172.30.30.12,172.30.30.13
+wsrep_sst_method         = mariabackup
+wsrep_slave_threads      = 2
+# Lecture causale : un SELECT voit toujours les écritures validées sur le cluster
+wsrep_sync_wait          = 1
+# gcache 128 Mo : un nœud brièvement arrêté se resynchronise par IST (incrémental)
+wsrep_provider_options   = "gcache.size=128M; gcache.recover=yes; pc.weight=1"
