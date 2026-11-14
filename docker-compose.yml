@@ -296,6 +296,30 @@ services:
   # ===========================================================================
   # Journaux centralisés
   # ===========================================================================
+  # --- DNS faisant autorité pour projet7.local (bind9, non-root) ---------------
+  dns:
+    <<: *hardening
+    build: ./dns
+    image: projet7/dns:9.20.30
+    container_name: dns
+    hostname: ns1
+    environment:
+      TZ: ${TZ:-Europe/Paris}
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 53   # port 53 sans root ni capacité
+    read_only: true
+    tmpfs: ["/tmp:size=8m,uid=100,gid=101"]
+    healthcheck:
+      test: ["CMD-SHELL", "[ \"$$(dig +time=2 +tries=1 +short @127.0.0.1 www.projet7.local A)\" = 192.168.89.100 ]"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    mem_limit: 64m
+    networks:
+      lan:
+        ipv4_address: 192.168.89.53
+
   logcollector:
     <<: *hardening
     build: ./logging

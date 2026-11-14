@@ -1,0 +1,23 @@
+; =============================================================================
+; Zone projet7.local – Projet 7 (servie par bind9 sur 192.168.89.53)
+; Incrémenter le numéro de série (AAAAMMJJnn) à chaque modification.
+; =============================================================================
+$ORIGIN projet7.local.
+$TTL 300
+@       IN SOA  ns1.projet7.local. hostmaster.projet7.local. (
+                2026111401 ; série
+                3600       ; refresh
+                600        ; retry
+                604800     ; expire
+                300 )      ; TTL négatif
+
+        IN NS   ns1.projet7.local.
+
+; --- Infrastructure -----------------------------------------------------------
+ns1     IN A    192.168.89.53
+lb1     IN A    192.168.89.101
+lb2     IN A    192.168.89.102
+
+; --- Service : la VIP Keepalived (portée par lb1 ou lb2) ---------------------
+@       IN A    192.168.89.100      ; projet7.local → redirigé vers www par HAProxy
+www     IN A    192.168.89.100

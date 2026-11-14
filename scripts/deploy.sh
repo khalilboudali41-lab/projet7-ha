@@ -7,6 +7,7 @@
 #   scripts/deploy.sh db         # tier données : Galera (bootstrap intelligent) + dbproxy + backup
 #   scripts/deploy.sh web        # tiers app (php-fpm ×3) + web (nginx ×3)
 #   scripts/deploy.sh lb         # journaux centralisés + lb1/lb2 (HAProxy + keepalived, VIP)
+#   scripts/deploy.sh dns        # bind9 sur 192.168.89.53 (zone projet7.local)
 #   scripts/deploy.sh all        # toutes les étapes disponibles
 #   scripts/deploy.sh status     # état des conteneurs et du cluster
 #   scripts/deploy.sh down       # arrête tout (les volumes/données sont CONSERVÉS)
@@ -195,6 +196,22 @@ status_lb() {
 }
 
 # -----------------------------------------------------------------------------
+deploy_dns() {
+  log "Construction de l'image DNS (contrôle de la zone au build)"
+  compose build -q dns
+  compose up -d --no-deps dns
+  wait_healthy dns 60
+  status_dns
+}
+
+status_dns() {
+  log "DNS 192.168.89.53 (bind9, faisant autorité pour projet7.local)"
+  local r
+  r=$(docker exec dns dig +short @127.0.0.1 www.projet7.local A 2>/dev/null) \
+    && printf '    www.projet7.local → %s\n' "${r:-?}" || printf '    dns arrêté\n'
+}
+
+# -----------------------------------------------------------------------------
 status_db() {
   log "Cluster Galera"
   local n
@@ -213,6 +230,7 @@ status() {
   compose ps --format 'table {{.Name}}\t{{.Image}}\t{{.Status}}'
   status_db
   status_lb
+  status_dns
 }
 
 # -----------------------------------------------------------------------------
@@ -222,8 +240,9 @@ case "${1:-}" in
   db)       deploy_db ;;
   web)      deploy_web ;;
   lb)       deploy_lb ;;
-  all)      init_env; deploy_db; deploy_web; deploy_lb ;;
+  dns)      deploy_dns ;;
+  all)      init_env; deploy_db; deploy_web; deploy_lb; deploy_dns ;;
   status)   status ;;
   down)     compose down; ok "Arrêté (volumes conservés : docker volume ls | grep projet7)" ;;
-  *)        sed -n '3,12p' "$0"; exit 1 ;;
+  *)        sed -n '3,13p' "$0"; exit 1 ;;
 esac
