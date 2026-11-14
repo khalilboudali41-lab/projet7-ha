@@ -11,9 +11,14 @@ x-hardening: &hardening
   security_opt: ["no-new-privileges:true"]
   cap_drop: [ALL]
   restart: unless-stopped
+  # Journaux centralisés (collecteur rsyslog) ; `docker logs` reste disponible
+  # grâce à la double journalisation du démon Docker
   logging:
-    driver: json-file
-    options: { max-size: "10m", max-file: "5", tag: "{{.Name}}" }
+    driver: syslog
+    options:
+      syslog-address: "udp://127.0.0.1:5514"
+      syslog-format: rfc5424micro
+      tag: "{{.Name}}"
 
 # --- Nœud Galera (modèle) -----------------------------------------------------
 x-galera: &galera
@@ -229,8 +234,112 @@ services:
       front_net: { ipv4_address: 172.30.10.13 }
       app_net:   { ipv4_address: 172.30.20.23 }
 
+  # ===========================================================================
+  # Tier load balancing : lb1 (MASTER) / lb2 (BACKUP), VIP 192.168.89.100
+  # ===========================================================================
+  lb1: &lb
+    <<: *hardening
+    build: ./lb
+    image: projet7/lb:3.2.26-ka2.3.4
+    container_name: lb1
+    hostname: lb1
+    environment: &lb1-env
+      LB_NAME: lb1
+      LB_IP: 192.168.89.101
+      PEER_IP: 192.168.89.102
+      VRRP_PRIORITY: "150"
+      VIP: 192.168.89.100
+      TZ: ${TZ:-Europe/Paris}
+    # keepalived : NET_ADMIN (VIP), NET_RAW (VRRP) ; superviseur : SETUID/SETGID
+    # (bascule vers l'utilisateur haproxy), KILL (signaux à HAProxy)
+    cap_add: [NET_ADMIN, NET_RAW, SETUID, SETGID, KILL]
+    sysctls:
+      net.ipv4.ip_nonlocal_bind: 1           # BACKUP : HAProxy écoute déjà sur la VIP
+      net.ipv4.ip_unprivileged_port_start: 0 # HAProxy non-root sur 80/443
+    read_only: true
+    tmpfs: ["/tmp:size=16m", "/run:size=4m"]
+    secrets: [haproxy_pem, haproxy_users_cfg, vrrp_password]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8405/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    stop_grace_period: 10s
+    mem_limit: 128m
+    networks:
+      lan:
+        ipv4_address: 192.168.89.101
+        interface_name: lan0
+        gw_priority: 100
+      front_net: { ipv4_address: 172.30.10.21 }
+      log_net:   { ipv4_address: 172.30.40.21 }
+
+  lb2:
+    <<: *lb
+    container_name: lb2
+    hostname: lb2
+    environment:
+      <<: *lb1-env
+      LB_NAME: lb2
+      LB_IP: 192.168.89.102
+      PEER_IP: 192.168.89.101
+      VRRP_PRIORITY: "100"
+    networks:
+      lan:
+        ipv4_address: 192.168.89.102
+        interface_name: lan0
+        gw_priority: 100
+      front_net: { ipv4_address: 172.30.10.22 }
+      log_net:   { ipv4_address: 172.30.40.22 }
+
+  # ===========================================================================
+  # Journaux centralisés
+  # ===========================================================================
+  logcollector:
+    <<: *hardening
+    build: ./logging
+    image: projet7/logcollector:8.2608
+    container_name: logcollector
+    hostname: logcollector
+    read_only: true
+    tmpfs: ["/tmp:size=16m"]
+    logging:          # pas de boucle : le collecteur journalise localement
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    volumes:
+      - ./logs:/logs:Z
+    ports:
+      - "127.0.0.1:5514:5514/udp"   # pilote syslog du démon Docker (loopback uniquement)
+    mem_limit: 64m
+    networks:
+      log_net: { ipv4_address: 172.30.40.10 }
+
 # =============================================================================
 networks:
+  # Réseau physique (VMnet8) : ipvlan L2 sur ens160 – chaque LB a sa propre IP
+  # sur le LAN, la VIP passe de l'un à l'autre (même MAC que la VM : pas besoin
+  # du mode promiscuité VMware)
+  lan:
+    driver: ipvlan
+    driver_opts: { parent: ens160, ipvlan_mode: l2 }
+    ipam:
+      config:
+        - subnet: 192.168.89.0/24
+          gateway: 192.168.89.2
+          aux_addresses:          # adresses réservées (jamais attribuées par Docker)
+            windows_host: 192.168.89.1
+            shim_host: 192.168.89.99
+            vip: 192.168.89.100
+            vm_ens160: 192.168.89.136
+
+  # Journaux : LB → collecteur (non internal : publication 127.0.0.1:5514/udp)
+  log_net:
+    driver: bridge
+    driver_opts: { com.docker.network.bridge.name: br-p7-log }
+    ipam:
+      config: [{ subnet: 172.30.40.0/24 }]
+
   # Tier web : LB ↔ nginx
   front_net:
     driver: bridge
@@ -275,3 +384,6 @@ secrets:
   db_monitor_password: { file: ./secrets/db_monitor_password }
   db_app_password:     { file: ./secrets/db_app_password }
   db_backup_password:  { file: ./secrets/db_backup_password }
+  haproxy_pem:         { file: ./secrets/haproxy_pem }        # certificat + clé (PKI phase 2)
+  haproxy_users_cfg:   { file: ./secrets/haproxy_users_cfg }  # userlist stats (SHA-512)
+  vrrp_password:       { file: ./secrets/vrrp_password }

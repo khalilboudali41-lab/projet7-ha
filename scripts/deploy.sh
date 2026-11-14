@@ -6,6 +6,7 @@
 #   scripts/deploy.sh secrets    # exporte les secrets de .env vers secrets/ (700, SELinux)
 #   scripts/deploy.sh db         # tier données : Galera (bootstrap intelligent) + dbproxy + backup
 #   scripts/deploy.sh web        # tiers app (php-fpm ×3) + web (nginx ×3)
+#   scripts/deploy.sh lb         # journaux centralisés + lb1/lb2 (HAProxy + keepalived, VIP)
 #   scripts/deploy.sh all        # toutes les étapes disponibles
 #   scripts/deploy.sh status     # état des conteneurs et du cluster
 #   scripts/deploy.sh down       # arrête tout (les volumes/données sont CONSERVÉS)
@@ -46,9 +47,24 @@ render_secrets() {
     # empêche les autres comptes de l'hôte d'y accéder.
     chmod 644 "secrets/$f"
   done
+  # Tier LB : mot de passe VRRP, certificat TLS (PKI), userlist des stats (empreinte SHA-512)
+  grep -E '^VRRP_PASSWORD=.' .env | cut -d= -f2- | tr -d '\n' > secrets/vrrp_password
+  local pem="pki/server/www.projet7.local/private/haproxy.pem"
+  [[ -f "$pem" ]] || die "$pem absent : lance scripts/pki.sh all"
+  install -m 644 "$pem" secrets/haproxy_pem
+  local su sp hash cur
+  su=$(grep -E '^HAPROXY_STATS_USER=' .env | cut -d= -f2-); sp=$(grep -E '^HAPROXY_STATS_PASSWORD=' .env | cut -d= -f2-)
+  [[ -n "$su" && -n "$sp" ]] || die "HAPROXY_STATS_USER/PASSWORD vides dans .env"
+  cur=$(awk '/ password /{print $4}' secrets/haproxy_users_cfg 2>/dev/null || true)
+  # on ne régénère l'empreinte que si le mot de passe a changé (fichier stable)
+  if [[ -z "$cur" ]] || [[ "$(openssl passwd -6 -salt "$(cut -d'$' -f3 <<<"$cur")" "$sp")" != "$cur" ]] || ! grep -q " user $su " secrets/haproxy_users_cfg; then
+    hash=$(openssl passwd -6 "$sp")
+    printf 'userlist stats_users\n    user %s password %s\n' "$su" "$hash" > secrets/haproxy_users_cfg
+  fi
+  chmod 644 secrets/vrrp_password secrets/haproxy_users_cfg
   # SELinux : sans ce label, container_t ne peut pas lire les fichiers (testé : EACCES)
   chcon -R -t container_file_t secrets
-  ok "secrets/ à jour (${#map[@]} fichiers, label container_file_t)"
+  ok "secrets/ à jour ($(ls secrets | wc -l) fichiers, label container_file_t)"
 }
 
 # -----------------------------------------------------------------------------
@@ -79,9 +95,8 @@ galera_up() {
 
   # Cas 1 : un cluster vivant existe → les nœuds manquants le rejoignent (IST/SST)
   if [[ -n "$synced" ]]; then
-    ok "Cluster actif (via $synced) : démarrage des nœuds manquants"
-    compose up -d "${GALERA_NODES[@]}"
-    for n in "${GALERA_NODES[@]}"; do wait_healthy "$n" 300; done
+    ok "Cluster actif (via $synced) : mise à jour/démarrage nœud par nœud (quorum préservé)"
+    for n in "${GALERA_NODES[@]}"; do compose up -d --no-deps "$n"; wait_healthy "$n" 300; done
     return
   fi
   [[ ${#running[@]} -eq 0 ]] || die "nœuds lancés mais aucun Synced/Primary (${running[*]}) : intervention manuelle (voir README, reprise Galera)"
@@ -129,8 +144,8 @@ deploy_db() {
   log "Construction de l'image dbproxy"
   compose build -q dbproxy1
   galera_up
-  compose up -d dbproxy1 dbproxy2 backup
-  wait_healthy dbproxy1 60; wait_healthy dbproxy2 60
+  rolling dbproxy1 dbproxy2
+  compose up -d --no-deps backup
   status_db
 }
 
@@ -139,10 +154,44 @@ deploy_web() {
   render_secrets
   log "Construction de l'image applicative"
   compose build -q app1
-  compose up -d app1 app2 app3
-  for n in app1 app2 app3; do wait_healthy "$n" 60; done
-  compose up -d web1 web2 web3
-  for n in web1 web2 web3; do wait_healthy "$n" 60; done
+  rolling app1 app2 app3
+  rolling web1 web2 web3
+}
+
+# Mise à jour sans interruption : un conteneur à la fois, en attendant qu'il soit sain
+rolling() { local n; for n in "$@"; do compose up -d --no-deps "$n"; wait_healthy "$n" 120; done; }
+
+# -----------------------------------------------------------------------------
+deploy_lb() {
+  render_secrets
+  install -d -m 750 logs
+  if ! ip -br link show p7-shim >/dev/null 2>&1; then
+    warn "interface p7-shim absente : la VM ne pourra pas joindre la VIP (le LAN/Windows, si) – voir docs/phase5-lb.md"
+  fi
+  log "Construction des images LB et collecteur de journaux"
+  compose build -q lb1 logcollector
+  compose up -d --no-deps logcollector
+  # lb2 d'abord : lb1 (prioritaire) reprend ensuite la VIP après preempt_delay
+  rolling lb2 lb1
+  sleep 2; status_lb
+}
+
+status_lb() {
+  log "VRRP / VIP 192.168.89.100"
+  local n
+  for n in lb1 lb2; do
+    if docker exec "$n" ip -4 -o addr show dev lan0 2>/dev/null | grep -q '192.168.89.100/'; then
+      printf '    %-4s MASTER (détient la VIP)\n' "$n"
+    elif docker inspect -f '{{.State.Running}}' "$n" 2>/dev/null | grep -q true; then
+      printf '    %-4s BACKUP\n' "$n"
+    else printf '    %-4s arrêté\n' "$n"; fi
+  done
+  log "Serveurs web vus par chaque LB"
+  for n in lb1 lb2; do
+    docker exec -u haproxy "$n" sh -c "echo 'show stat' | socat stdio unix-connect:/tmp/admin.sock" 2>/dev/null \
+      | awk -F, -v p="$n" 'NR==1{for(i=1;i<=NF;i++)h[$i]=i; next}
+          $1=="be_web" && $2!="FRONTEND" && $2!="BACKEND" { printf "    %-4s %-5s %-6s check=%s\n", p, $2, $h["status"], $h["check_status"] }'
+  done
 }
 
 # -----------------------------------------------------------------------------
@@ -163,6 +212,7 @@ status_db() {
 status() {
   compose ps --format 'table {{.Name}}\t{{.Image}}\t{{.Status}}'
   status_db
+  status_lb
 }
 
 # -----------------------------------------------------------------------------
@@ -171,7 +221,8 @@ case "${1:-}" in
   secrets)  render_secrets ;;
   db)       deploy_db ;;
   web)      deploy_web ;;
-  all)      init_env; deploy_db; deploy_web ;;
+  lb)       deploy_lb ;;
+  all)      init_env; deploy_db; deploy_web; deploy_lb ;;
   status)   status ;;
   down)     compose down; ok "Arrêté (volumes conservés : docker volume ls | grep projet7)" ;;
   *)        sed -n '3,12p' "$0"; exit 1 ;;

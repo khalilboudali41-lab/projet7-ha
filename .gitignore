@@ -23,3 +23,5 @@ pki/offline/
 haproxy.pem
 # Secrets générés à partir de .env par scripts/deploy.sh
 secrets/
+# Journaux centralisés
+logs/

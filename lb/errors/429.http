@@ -1,0 +1,7 @@
+HTTP/1.1 429 Too Many Requests
+Content-Type: text/plain; charset=utf-8
+Cache-Control: no-store
+Retry-After: 10
+Connection: close
+
+Trop de requêtes : réessayez dans quelques secondes.
