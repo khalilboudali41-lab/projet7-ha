@@ -1,7 +1,7 @@
 <?php
 /**
  * Projet 7 – application « vitrine HA »
- * Affiche, pour chaque requête : le conteneur web (nginx) et le conteneur app
+ * Affiche, pour chaque requête : le load balancer (HAProxy), le conteneur web (nginx), le conteneur app
  * (php-fpm) qui l'ont servie, le nœud Galera utilisé, l'heure et un compteur
  * stocké en base. Application sans état (aucune session) : n'importe quel
  * serveur web/app peut servir n'importe quelle requête.
@@ -15,6 +15,8 @@ const DB_USER = 'vitrine';
 
 $webNode = preg_replace('/[^A-Za-z0-9._-]/', '', (string)($_SERVER['WEB_NODE'] ?? 'inconnu'));
 $appNode = gethostname() ?: 'inconnu';
+// Positionné (et écrasé) par HAProxy ; filtré comme WEB_NODE
+$lbNode  = preg_replace('/[^A-Za-z0-9._-]/', '', (string)($_SERVER['HTTP_X_LB_NODE'] ?? '')) ?: '—';
 header('X-App-Node: ' . $appNode);
 
 function db_connect(): PDO
@@ -119,7 +121,7 @@ switch ($path) {
         try {
             $v = record_visit($webNode, $appNode);
             unset($v['recent']);
-            echo json_encode(['web' => $webNode, 'app' => $appNode, 'heure' => $now->format(DATE_ATOM)] + $v,
+            echo json_encode(['lb' => $lbNode, 'web' => $webNode, 'app' => $appNode, 'heure' => $now->format(DATE_ATOM)] + $v,
                 JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), "\n";
         } catch (Throwable) {
             http_response_code(503);
@@ -169,6 +171,7 @@ try {
   <?php if ($error): ?><p class="alert"><?= h($error) ?></p><?php endif; ?>
 
   <section class="cards">
+    <article class="card"><h2>Load balancer</h2><p class="val"><?= h($lbNode) ?></p><p class="hint">HAProxy · VIP</p></article>
     <article class="card"><h2>Serveur web</h2><p class="val"><?= h($webNode) ?></p><p class="hint">nginx</p></article>
     <article class="card"><h2>Serveur app</h2><p class="val"><?= h($appNode) ?></p><p class="hint">php-fpm</p></article>
     <article class="card"><h2>Nœud Galera</h2><p class="val"><?= h($v['db_node'] ?? '—') ?></p><p class="hint">via dbproxy</p></article>
