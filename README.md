@@ -1,7 +1,6 @@
 # Projet 7 – Site web N-tiers haute disponibilité · `https://www.projet7.local`
 
-**Mini-projet 7 – PCA (ING-5-J-SSIRF-I)** · binôme **BOUDALI Khalil & MEJRI Rania**
-Validation technique le 18/11/2026 · soutenance (5 min) le 25/11/2026 · démonstration : [DEMO.md](DEMO.md)
+
 
 Une application web « vitrine HA » servie **uniquement en HTTPS**, sans point unique de défaillance de bout en bout :
 
