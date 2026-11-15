@@ -30,6 +30,7 @@ DEFAULT_SANS=("www.projet7.local" "projet7.local")
 
 log()  { printf '\033[1;34m[pki]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m  ✔\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m  !\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[pki] ERREUR :\033[0m %s\n' "$*" >&2; exit 1; }
 
 # Arborescence d'une CA (base openssl ca)
@@ -180,19 +181,23 @@ offline() {
   [[ -f "$pass" ]] || die "$pass absent : impossible de contrôler l'archive"
 
   local out="$PKI_DIR/offline/root-ca-key-$(date +%Y%m%d-%H%M%S).tar.gz.enc"
+  log "Archive chiffrée de la clé Root (${ARCH_ENC_OPTS[*]}) – choisis une phrase de passe forte"
+  read_arch_pass confirm
   mkdir -p "$PKI_DIR/offline"; chmod 700 "$PKI_DIR/offline"
-  log "Archive chiffrée de la clé Root (AES-256 + PBKDF2) – choisis une phrase de passe forte (saisie 2 fois)"
+  # La phrase passe par le descripteur 3 : l'entrée standard de openssl est le flux tar
   tar -C "$ROOT" -czf - private/root-ca.key private/root-ca.pass \
-    | openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -out "$out"
+    | openssl enc -e "${ARCH_ENC_OPTS[@]}" -salt -pass fd:3 -out "$out" 3< <(printf '%s\n' "$ARCH_PW") \
+    || { rm -f "$out"; ARCH_PW=""; die "chiffrement de l'archive en échec : clé Root NON effacée"; }
   chmod 600 "$out"
 
-  # Contrôle complet AVANT effacement (même contrôle que check-archive / restore-root)
-  log "Contrôle : déchiffrement de l'archive (même phrase de passe, saisie 1 fois)"
+  # Contrôle complet AVANT effacement, avec la MÊME phrase (en mémoire, pas de 3e saisie)
+  log "Contrôle : déchiffrement de l'archive avec la même phrase de passe"
   if ! unpack_root_archive "$out"; then
+    ARCH_PW=""
     wipe_dir "$ARCH_DIR"
     die "archive non conforme : clé Root NON effacée (archive à supprimer : $out)"
   fi
-  wipe_dir "$ARCH_DIR"
+  wipe_dir "$ARCH_DIR"; ARCH_PW=""
   ok "Archive contrôlée : clé + .pass présents, la clé s'ouvre et correspond au certificat Root"
 
   shred -u "$key" "$pass"
@@ -202,17 +207,51 @@ offline() {
   echo "  → limite : shred ne garantit pas l'effacement physique sur XFS/LVM ni dans les instantanés VMware"
 }
 
+# --- Archive chiffrée de la clé Root ------------------------------------------
+# Options openssl enc : UNE seule définition pour le chiffrement et le déchiffrement
+# (-md explicite : ne dépend pas du défaut de la version d'openssl). -salt en plus au
+# chiffrement. Identiques aux archives antérieures (défaut -md sha256 d'OpenSSL 3).
+ARCH_ENC_OPTS=(-aes-256-cbc -pbkdf2 -iter 600000 -md sha256)
+ARCH_PW=""; ARCH_DIR=""
+
+# Phrase de passe de l'archive, lue PAR LE SCRIPT sur le terminal (/dev/tty) :
+#  - jamais sur l'entrée standard (au chiffrement, celle d'openssl est le flux tar) ;
+#  - invites écrites sur /dev/tty : rien ne passe par stdout/stderr (| tee …) ;
+#  - transmise ensuite à openssl par un descripteur (fd:3), jamais en argument.
+# read_arch_pass confirm → 2 saisies comparées ; read_arch_pass → 1 saisie.
+# Tests automatisés uniquement : PKI_ARCHIVE_PASS (signalé à chaque usage).
+read_arch_pass() {
+  local a b
+  if [[ -n "${PKI_ARCHIVE_PASS:-}" ]]; then
+    warn "mode non interactif : phrase d'archive lue dans PKI_ARCHIVE_PASS (réservé aux tests)"
+    ARCH_PW=$PKI_ARCHIVE_PASS; return 0
+  fi
+  { : </dev/tty >/dev/tty; } 2>/dev/null \
+    || die "aucun terminal disponible : lancer pki.sh dans une session SSH interactive (pas via « ! » de Claude Code ni avec une entrée redirigée)"
+  printf 'Phrase de passe de l'"'"'archive : ' >/dev/tty; IFS= read -r -s a </dev/tty; printf '\n' >/dev/tty
+  [[ ${#a} -ge 12 ]] || die "phrase de passe trop courte (12 caractères minimum)"
+  if [[ "${1:-}" == confirm ]]; then
+    printf 'Confirmation               : ' >/dev/tty; IFS= read -r -s b </dev/tty; printf '\n' >/dev/tty
+    [[ "$a" == "$b" ]] || die "les deux saisies diffèrent : rien n'a été fait"
+    if printf '%s' "$a" | LC_ALL=C grep -q '[^ -~]'; then
+      warn "la phrase contient des caractères non ASCII (accents, €, touches mortes…) : vérifie que tu sauras la retaper à l'identique sur un autre clavier"
+    fi
+  fi
+  ARCH_PW=$a
+  ok "Phrase de passe saisie (${#a} caractères)"
+}
+
 # Déchiffre une archive de clé Root dans un répertoire tmpfs (ARCH_DIR) et la valide :
 # en-tête openssl, EXACTEMENT private/root-ca.key + private/root-ca.pass, clé chiffrée
-# qui s'ouvre avec son .pass et correspond au certificat Root. 1 saisie de la phrase
-# d'archive. Code retour 0 = conforme. L'appelant efface ARCH_DIR (wipe_dir).
-ARCH_DIR=""
+# qui s'ouvre avec son .pass et correspond au certificat Root. Utilise ARCH_PW.
+# Code retour 0 = conforme. L'appelant efface ARCH_DIR (wipe_dir).
 unpack_root_archive() {
   local f=$1
   [[ -f "$f" ]] || die "archive introuvable : $f"
   [[ "$(head -c 8 "$f")" == Salted__ ]] || die "$f n'est pas une archive openssl enc (en-tête Salted__ absent)"
+  [[ -n "$ARCH_PW" ]] || die "phrase d'archive non saisie"
   ARCH_DIR=$(mktemp -d /dev/shm/p7-root-check.XXXXXX)
-  openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in "$f" \
+  openssl enc -d "${ARCH_ENC_OPTS[@]}" -pass fd:3 -in "$f" 3< <(printf '%s\n' "$ARCH_PW") \
     | tar -C "$ARCH_DIR" --no-same-owner -xzf - 2>/dev/null || return 1
   [[ "$(cd "$ARCH_DIR" && find . -type f | sort | tr '\n' ' ')" == "./private/root-ca.key ./private/root-ca.pass " ]] || return 1
   grep -q 'ENCRYPTED' "$ARCH_DIR/private/root-ca.key" || return 1
@@ -225,12 +264,14 @@ wipe_dir() { [[ -n "${1:-}" && -d "$1" ]] || return 0; find "$1" -type f -exec s
 check_archive() {
   local f=${1:?fichier .enc requis}
   require_owner
-  log "Test de l'archive $f (phrase d'archive, saisie 1 fois) – rien n'est restauré"
+  [[ -f "$f" ]] || die "archive introuvable : $f"
+  log "Test de l'archive $f – rien n'est restauré"
+  read_arch_pass
   if unpack_root_archive "$f"; then
-    wipe_dir "$ARCH_DIR"
+    wipe_dir "$ARCH_DIR"; ARCH_PW=""
     ok "Archive conforme : restore-root saurait restaurer la clé Root (clé ↔ certificat Root vérifiés)"
   else
-    wipe_dir "$ARCH_DIR"; die "archive NON conforme ou phrase d'archive incorrecte : $f"
+    wipe_dir "$ARCH_DIR"; ARCH_PW=""; die "archive NON conforme ou phrase d'archive incorrecte : $f"
   fi
 }
 
@@ -241,14 +282,16 @@ restore_root() {
     present)      die "une clé Root est déjà présente dans $ROOT/private : restauration refusée (rien n'est écrasé)" ;;
     inaccessible) die "$ROOT/private inaccessible pour $(id -un)" ;;
   esac
-  log "Restauration depuis $f (phrase d'archive, saisie 1 fois)"
+  [[ -f "$f" ]] || die "archive introuvable : $f"
+  log "Restauration depuis $f"
+  read_arch_pass
   if ! unpack_root_archive "$f"; then
-    wipe_dir "$ARCH_DIR"; die "archive NON conforme ou phrase d'archive incorrecte : rien n'est restauré"
+    wipe_dir "$ARCH_DIR"; ARCH_PW=""; die "archive NON conforme ou phrase d'archive incorrecte : rien n'est restauré"
   fi
   install -d -m 700 "$ROOT/private"
   install -m 600 "$ARCH_DIR/private/root-ca.key"  "$ROOT/private/root-ca.key"
   install -m 600 "$ARCH_DIR/private/root-ca.pass" "$ROOT/private/root-ca.pass"
-  wipe_dir "$ARCH_DIR"
+  wipe_dir "$ARCH_DIR"; ARCH_PW=""
   [[ "$(openssl pkey -in "$ROOT/private/root-ca.key" -passin "file:$ROOT/private/root-ca.pass" -pubout)" \
      == "$(openssl x509 -in "$ROOT/certs/root-ca.crt" -noout -pubkey)" ]] || die "clé restaurée ≠ certificat Root"
   ok "Clé Root restaurée et vérifiée (pense à refaire 'offline' ensuite)"
