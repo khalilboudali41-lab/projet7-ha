@@ -20,6 +20,7 @@ services:
       - --wsrep_node_name=galera2
       - --wsrep_node_address=192.168.89.138
       - --bind-address=192.168.89.138
+      - --wsrep_node_incoming_address=192.168.89.138:3306
       - --wsrep_cluster_address=gcomm://192.168.89.136,192.168.89.138,192.168.89.137
       - --wsrep_provider_options=gcache.size=128M;gcache.recover=yes;pc.weight=1;gmcast.listen_addr=tcp://192.168.89.138:4567
     volumes:

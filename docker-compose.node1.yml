@@ -21,6 +21,8 @@ services:
       - --wsrep_node_address=192.168.89.136
       # Écoute sur l'IP de la VM uniquement (jamais sur les bridges Docker)
       - --bind-address=192.168.89.136
+      # Adresse SQL annoncée au cluster (sans elle : « 192.168.89.136:0 », bind-address étant fixé)
+      - --wsrep_node_incoming_address=192.168.89.136:3306
       - --wsrep_cluster_address=gcomm://192.168.89.136,192.168.89.138,192.168.89.137
       # Options de galera.cnf + gmcast.listen_addr (gcomm limité à l'IP de la VM)
       - --wsrep_provider_options=gcache.size=128M;gcache.recover=yes;pc.weight=1;gmcast.listen_addr=tcp://192.168.89.136:4567
