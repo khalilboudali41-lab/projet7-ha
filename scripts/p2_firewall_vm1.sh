@@ -53,6 +53,23 @@ fw --policy="$POLICY" --add-egress-zone=public
 # Priorités explicites : sans elles, firewalld évalue les rejets AVANT les acceptations
 fw --policy="$POLICY" --add-rich-rule="rule priority=\"-2\" family=\"ipv4\" source address=\"$UPLINK\" destination address=\"$PEER_VM/32\" port port=\"3306\" protocol=\"tcp\" accept"
 fw --policy="$POLICY" --add-rich-rule="rule priority=\"-1\" family=\"ipv4\" source address=\"$UPLINK\" reject"
+# Tout AUTRE conteneur (docker0, log_net…) sort masqué en $EXPECTED_IP, adresse que
+# les règles de l'autre VM et de l'arbitre autorisent : on le rejette ici.
+fw --policy="$POLICY" --add-rich-rule="rule priority=\"-1\" family=\"ipv4\" destination address=\"$PEER_VM/32\" reject"
+fw --policy="$POLICY" --add-rich-rule="rule priority=\"-1\" family=\"ipv4\" destination address=\"$ARBITER/32\" reject"
+
+# --- Conteneurs → Galera de CETTE VM (réseau hôte) ------------------------------
+# La zone docker est en target ACCEPT : sans cette policy, tout conteneur joindrait
+# galera1 (dont gcomm 4567, non authentifié). Seul db_uplink → 3306 est accepté.
+HPOL=p7-docker-to-host
+fw --get-policies | tr ' ' '\n' | grep -qx "$HPOL" || fw --new-policy="$HPOL"
+fw --policy="$HPOL" --set-priority=-10
+fw --policy="$HPOL" --add-ingress-zone=docker
+fw --policy="$HPOL" --add-egress-zone=HOST
+fw --policy="$HPOL" --add-rich-rule="rule priority=\"-2\" family=\"ipv4\" source address=\"$UPLINK\" destination address=\"$EXPECTED_IP/32\" port port=\"3306\" protocol=\"tcp\" accept"
+for p in 3306 4567 4568 4444; do
+  fw --policy="$HPOL" --add-rich-rule="rule priority=\"-1\" family=\"ipv4\" port port=\"$p\" protocol=\"tcp\" reject"
+done
 
 # --- Application ---------------------------------------------------------------
 firewall-cmd --reload
@@ -63,3 +80,5 @@ echo; echo "== Règles riches (zone public)"
 firewall-cmd --zone=public --list-rich-rules
 echo; echo "== Policy $POLICY"
 firewall-cmd --info-policy="$POLICY"
+echo; echo "== Policy $HPOL"
+firewall-cmd --info-policy="$HPOL"
