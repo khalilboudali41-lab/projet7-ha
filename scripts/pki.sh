@@ -12,6 +12,7 @@
 #         scripts/pki.sh verify [CN]         # contrôles de la chaîne
 #         scripts/pki.sh offline             # archive chiffrée de la clé Root puis effacement
 #         scripts/pki.sh restore-root FICHIER.enc  # remet la clé Root (renouvellement intermédiaire)
+#         scripts/pki.sh check-archive FICHIER.enc # teste l'archive Root sans rien restaurer
 #         scripts/pki.sh rotate-pass         # nouvelles phrases de passe des clés CA (clés inchangées)
 #
 # Idempotent : ne régénère jamais une CA existante. Aucune commande sudo.
@@ -185,18 +186,13 @@ offline() {
     | openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -out "$out"
   chmod 600 "$out"
 
-  # Contrôle complet AVANT effacement, en mémoire (tmpfs) : contenu, ouverture de la
-  # clé avec son .pass, correspondance avec le certificat Root
+  # Contrôle complet AVANT effacement (même contrôle que check-archive / restore-root)
   log "Contrôle : déchiffrement de l'archive (même phrase de passe, saisie 1 fois)"
-  local t; t=$(mktemp -d /dev/shm/p7-root-check.XXXXXX)
-  if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in "$out" | tar -C "$t" -xzf - \
-     || [[ ! -s "$t/private/root-ca.key" || ! -s "$t/private/root-ca.pass" ]] \
-     || [[ "$(openssl pkey -in "$t/private/root-ca.key" -passin "file:$t/private/root-ca.pass" -pubout 2>/dev/null)" \
-           != "$(openssl x509 -in "$ROOT/certs/root-ca.crt" -noout -pubkey)" ]]; then
-    find "$t" -type f -exec shred -u {} +; rm -rf "$t"
-    die "archive incomplète ou illisible : clé Root NON effacée (archive à supprimer : $out)"
+  if ! unpack_root_archive "$out"; then
+    wipe_dir "$ARCH_DIR"
+    die "archive non conforme : clé Root NON effacée (archive à supprimer : $out)"
   fi
-  find "$t" -type f -exec shred -u {} +; rm -rf "$t"
+  wipe_dir "$ARCH_DIR"
   ok "Archive contrôlée : clé + .pass présents, la clé s'ouvre et correspond au certificat Root"
 
   shred -u "$key" "$pass"
@@ -206,11 +202,56 @@ offline() {
   echo "  → limite : shred ne garantit pas l'effacement physique sur XFS/LVM ni dans les instantanés VMware"
 }
 
+# Déchiffre une archive de clé Root dans un répertoire tmpfs (ARCH_DIR) et la valide :
+# en-tête openssl, EXACTEMENT private/root-ca.key + private/root-ca.pass, clé chiffrée
+# qui s'ouvre avec son .pass et correspond au certificat Root. 1 saisie de la phrase
+# d'archive. Code retour 0 = conforme. L'appelant efface ARCH_DIR (wipe_dir).
+ARCH_DIR=""
+unpack_root_archive() {
+  local f=$1
+  [[ -f "$f" ]] || die "archive introuvable : $f"
+  [[ "$(head -c 8 "$f")" == Salted__ ]] || die "$f n'est pas une archive openssl enc (en-tête Salted__ absent)"
+  ARCH_DIR=$(mktemp -d /dev/shm/p7-root-check.XXXXXX)
+  openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in "$f" \
+    | tar -C "$ARCH_DIR" --no-same-owner -xzf - 2>/dev/null || return 1
+  [[ "$(cd "$ARCH_DIR" && find . -type f | sort | tr '\n' ' ')" == "./private/root-ca.key ./private/root-ca.pass " ]] || return 1
+  grep -q 'ENCRYPTED' "$ARCH_DIR/private/root-ca.key" || return 1
+  [[ "$(openssl pkey -in "$ARCH_DIR/private/root-ca.key" -passin "file:$ARCH_DIR/private/root-ca.pass" -pubout 2>/dev/null)" \
+     == "$(openssl x509 -in "$ROOT/certs/root-ca.crt" -noout -pubkey)" ]] || return 1
+}
+wipe_dir() { [[ -n "${1:-}" && -d "$1" ]] || return 0; find "$1" -type f -exec shred -u {} + 2>/dev/null; rm -rf "$1"; }
+
+# Test d'une archive SANS rien restaurer (prouve que restore-root fonctionnerait)
+check_archive() {
+  local f=${1:?fichier .enc requis}
+  require_owner
+  log "Test de l'archive $f (phrase d'archive, saisie 1 fois) – rien n'est restauré"
+  if unpack_root_archive "$f"; then
+    wipe_dir "$ARCH_DIR"
+    ok "Archive conforme : restore-root saurait restaurer la clé Root (clé ↔ certificat Root vérifiés)"
+  else
+    wipe_dir "$ARCH_DIR"; die "archive NON conforme ou phrase d'archive incorrecte : $f"
+  fi
+}
+
 restore_root() {
   local f=${1:?fichier .enc requis}
   require_owner
-  openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in "$f" | tar -C "$ROOT" -xzf -
-  chmod 600 "$ROOT/private/"*; ok "Clé Root restaurée (pense à refaire 'offline' ensuite)"
+  case "$(root_key_state)" in
+    present)      die "une clé Root est déjà présente dans $ROOT/private : restauration refusée (rien n'est écrasé)" ;;
+    inaccessible) die "$ROOT/private inaccessible pour $(id -un)" ;;
+  esac
+  log "Restauration depuis $f (phrase d'archive, saisie 1 fois)"
+  if ! unpack_root_archive "$f"; then
+    wipe_dir "$ARCH_DIR"; die "archive NON conforme ou phrase d'archive incorrecte : rien n'est restauré"
+  fi
+  install -d -m 700 "$ROOT/private"
+  install -m 600 "$ARCH_DIR/private/root-ca.key"  "$ROOT/private/root-ca.key"
+  install -m 600 "$ARCH_DIR/private/root-ca.pass" "$ROOT/private/root-ca.pass"
+  wipe_dir "$ARCH_DIR"
+  [[ "$(openssl pkey -in "$ROOT/private/root-ca.key" -passin "file:$ROOT/private/root-ca.pass" -pubout)" \
+     == "$(openssl x509 -in "$ROOT/certs/root-ca.crt" -noout -pubkey)" ]] || die "clé restaurée ≠ certificat Root"
+  ok "Clé Root restaurée et vérifiée (pense à refaire 'offline' ensuite)"
 }
 
 # -----------------------------------------------------------------------------
@@ -267,6 +308,7 @@ case "$cmd" in
   verify)       verify "$@" ;;
   offline)      offline ;;
   restore-root) restore_root "$@" ;;
+  check-archive) check_archive "$@" ;;
   rotate-pass)  rotate_pass ;;
-  *)            sed -n '3,18p' "$0"; exit 1 ;;
+  *)            sed -n '3,19p' "$0"; exit 1 ;;
 esac
