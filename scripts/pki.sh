@@ -145,23 +145,70 @@ verify() {
 }
 
 # -----------------------------------------------------------------------------
+# Les fichiers private/ sont en 700/600 : seul le propriétaire de pki/ y accède.
+# Lancé par un autre compte (ou avec sudo), un test -f échoue par MANQUE DE DROITS
+# et non par absence – l'ancienne version concluait alors à tort « déjà hors ligne ».
+require_owner() {
+  local uid; uid=$(stat -c %u "$PKI_DIR")
+  [[ $EUID -eq $uid ]] || die "à lancer en tant que $(stat -c %U "$PKI_DIR") (propriétaire de pki/), sans sudo – lancé ici par $(id -un)"
+}
+
+# État de la clé Root : present | absent | inaccessible (jamais de confusion)
+root_key_state() {
+  local d="$ROOT/private"
+  [[ -e "$d" ]] || { echo absent; return; }
+  [[ -r "$d" && -x "$d" ]] || { echo inaccessible; return; }
+  if [[ -e "$d/root-ca.key" ]]; then
+    [[ -r "$d/root-ca.key" ]] && echo present || echo inaccessible
+  else
+    echo absent
+  fi
+}
+
 offline() {
-  [[ -f "$ROOT/private/root-ca.key" ]] || die "clé Root déjà hors ligne"
+  require_owner
+  local key="$ROOT/private/root-ca.key" pass="$ROOT/private/root-ca.pass" archives
+  case "$(root_key_state)" in
+    present) ;;
+    inaccessible) die "$ROOT/private ou la clé Root est illisible pour $(id -un) : droits à vérifier (attendu : 700/600, propriétaire de pki/)" ;;
+    absent)
+      archives=$(ls -1 "$PKI_DIR"/offline/root-ca-key-*.tar.gz.enc 2>/dev/null || true)
+      [[ -n "$archives" ]] && die "clé Root déjà hors ligne (archive(s) : $(echo $archives))"
+      die "clé Root absente de $ROOT/private et aucune archive dans pki/offline : situation anormale, ne rien effacer" ;;
+  esac
+  [[ -f "$pass" ]] || die "$pass absent : impossible de contrôler l'archive"
+
   local out="$PKI_DIR/offline/root-ca-key-$(date +%Y%m%d-%H%M%S).tar.gz.enc"
   mkdir -p "$PKI_DIR/offline"; chmod 700 "$PKI_DIR/offline"
-  log "Archive chiffrée de la clé Root (AES-256 + PBKDF2) – choisis une phrase de passe forte"
+  log "Archive chiffrée de la clé Root (AES-256 + PBKDF2) – choisis une phrase de passe forte (saisie 2 fois)"
   tar -C "$ROOT" -czf - private/root-ca.key private/root-ca.pass \
     | openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -out "$out"
-  log "Contrôle : déchiffrement de l'archive (même phrase de passe)"
-  openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in "$out" | tar -tzf - | grep -q 'private/root-ca.key' \
-    || die "archive illisible : clé Root NON effacée"
-  shred -u "$ROOT/private/root-ca.key" "$ROOT/private/root-ca.pass"
-  ok "Clé Root effacée de la VM. Archive : $out"
+  chmod 600 "$out"
+
+  # Contrôle complet AVANT effacement, en mémoire (tmpfs) : contenu, ouverture de la
+  # clé avec son .pass, correspondance avec le certificat Root
+  log "Contrôle : déchiffrement de l'archive (même phrase de passe, saisie 1 fois)"
+  local t; t=$(mktemp -d /dev/shm/p7-root-check.XXXXXX)
+  if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in "$out" | tar -C "$t" -xzf - \
+     || [[ ! -s "$t/private/root-ca.key" || ! -s "$t/private/root-ca.pass" ]] \
+     || [[ "$(openssl pkey -in "$t/private/root-ca.key" -passin "file:$t/private/root-ca.pass" -pubout 2>/dev/null)" \
+           != "$(openssl x509 -in "$ROOT/certs/root-ca.crt" -noout -pubkey)" ]]; then
+    find "$t" -type f -exec shred -u {} +; rm -rf "$t"
+    die "archive incomplète ou illisible : clé Root NON effacée (archive à supprimer : $out)"
+  fi
+  find "$t" -type f -exec shred -u {} +; rm -rf "$t"
+  ok "Archive contrôlée : clé + .pass présents, la clé s'ouvre et correspond au certificat Root"
+
+  shred -u "$key" "$pass"
+  [[ ! -e "$key" && ! -e "$pass" ]] || die "effacement incomplet : $(ls "$ROOT/private")"
+  ok "Clé Root et phrase de passe effacées de la VM (shred). Archive : $out"
   echo "  → copie-la HORS de la VM (clé USB / coffre), puis supprime-la : shred -u '$out'"
+  echo "  → limite : shred ne garantit pas l'effacement physique sur XFS/LVM ni dans les instantanés VMware"
 }
 
 restore_root() {
   local f=${1:?fichier .enc requis}
+  require_owner
   openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in "$f" | tar -C "$ROOT" -xzf -
   chmod 600 "$ROOT/private/"*; ok "Clé Root restaurée (pense à refaire 'offline' ensuite)"
 }

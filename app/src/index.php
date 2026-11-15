@@ -58,7 +58,9 @@ function record_visit(string $web, string $app): array
         $db->beginTransaction();
         $db->exec('UPDATE compteur SET valeur = LAST_INSERT_ID(valeur + 1) WHERE id = 1');
         $count  = (int)$db->query('SELECT LAST_INSERT_ID()')->fetchColumn();
-        $dbNode = (string)$db->query('SELECT @@hostname')->fetchColumn();
+        // Nom du nœud Galera (galera1, galera2…) : @@hostname donnerait le nom de la
+        // VM quand Galera tourne en réseau hôte (multi-VM)
+        $dbNode = (string)$db->query('SELECT @@wsrep_node_name')->fetchColumn();
         $db->prepare('INSERT INTO visites (web, app, db_node) VALUES (?, ?, ?)')
            ->execute([$web, $app, $dbNode]);
         $db->commit();
@@ -101,7 +103,7 @@ switch ($path) {
         header('Content-Type: text/plain; charset=utf-8');
         header('Cache-Control: no-store');
         try {
-            $node = with_db(fn (PDO $db) => (string)$db->query('SELECT @@hostname')->fetchColumn());
+            $node = with_db(fn (PDO $db) => (string)$db->query('SELECT @@wsrep_node_name')->fetchColumn());
             echo "ok db={$node}\n";
         } catch (Throwable) {
             http_response_code(503);
