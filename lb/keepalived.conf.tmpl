@@ -21,6 +21,21 @@ vrrp_script chk_haproxy {
     rise 2
 }
 
+# Multi-VM : chaîne complète de CETTE VM (web → app → dbproxy → Galera). Échec →
+# priorité −60 (lb1 150 → 90 < lb2 100 : la VIP part sur l'autre VM ; lb2 100 → 40 :
+# reste BACKUP). Poids plutôt que FAULT : si la base tombe PARTOUT, les deux LB
+# baissent d'autant et la VIP reste en place (page 503) au lieu de disparaître.
+# Timeout : /healthz/db = 2 essais × (2 s + 0,3 s) au pire. Suivie seulement en
+# multi-VM (@TRACK_DB@ remplacé par l'entrypoint).
+vrrp_script chk_db_path {
+    script "/usr/bin/wget -q -T 5 -O /dev/null http://172.30.10.11:8080/healthz/db"
+    interval 3
+    timeout 6
+    fall 2
+    rise 3
+    weight -60
+}
+
 vrrp_instance VI_PROJET7 {
     state BACKUP
     interface lan0
@@ -41,6 +56,7 @@ vrrp_instance VI_PROJET7 {
     }
     track_script {
         chk_haproxy
+        @TRACK_DB@
     }
     # ipvlan : réessaie la pose de la VIP pendant que l'ancien MASTER la libère
     notify_master "/usr/local/bin/vip-ensure.sh @VIP@ lan0" root

@@ -129,6 +129,9 @@ services:
 
   # ===========================================================================
   # lb – HAProxy + keepalived ; VRRP unicast entre lb1 (VM1) et lb2 (VM2)
+  #  - be_web : web local en priorité, web de l'autre VM en secours (via fe_peer
+  #    du LB pair, 8443/TLS, IP du pair uniquement)
+  #  - keepalived : chk_haproxy (FAULT) + chk_db_path (poids −60, chaîne vers la base)
   # ===========================================================================
   lb:
     <<: *hardening
@@ -147,6 +150,9 @@ services:
     read_only: true
     tmpfs: ["/tmp:size=16m", "/run:size=4m"]
     secrets: [haproxy_pem, haproxy_users_cfg, vrrp_password]
+    volumes:
+      # Certificat PUBLIC de la CA racine : vérifie le TLS du LB pair (be_web → peer-vm)
+      - ./pki/root-ca/certs/root-ca.crt:/usr/local/etc/haproxy/root-ca.crt:ro,z
     healthcheck:
       test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8405/healthz"]
       interval: 5s

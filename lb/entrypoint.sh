@@ -6,6 +6,7 @@
 #   3. lance keepalived (root : netlink + sockets raw, capacités minimales) ;
 #   4. si l'un meurt → arrêt propre de l'autre → sortie (Docker redémarre).
 # Variables : LB_NAME, LB_IP, PEER_IP, VRRP_PRIORITY, VIP
+#   P7_MULTI_VM (définie) : suit aussi chk_db_path (chaîne vers la base, poids −60)
 # =============================================================================
 set -eu
 : "${LB_NAME:?}" "${LB_IP:?}" "${PEER_IP:?}" "${VRRP_PRIORITY:?}" "${VIP:?}"
@@ -16,6 +17,7 @@ VRRP_PASS=$(head -c 8 /run/secrets/vrrp_password)
 umask 077
 sed -e "s/@LB_NAME@/$LB_NAME/g" -e "s/@LB_IP@/$LB_IP/g" -e "s/@PEER_IP@/$PEER_IP/g" \
     -e "s/@PRIORITY@/$VRRP_PRIORITY/g" -e "s|@VIP@|$VIP|g" -e "s/@VRRP_PASS@/$VRRP_PASS/g" \
+    -e "s/@TRACK_DB@/${P7_MULTI_VM:+chk_db_path}/" \
     /etc/keepalived/keepalived.conf.tmpl > /tmp/keepalived.conf
 
 CFG="-f /usr/local/etc/haproxy/haproxy.cfg -f /run/secrets/haproxy_users_cfg"

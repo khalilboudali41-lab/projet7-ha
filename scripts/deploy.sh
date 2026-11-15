@@ -14,6 +14,13 @@
 # =============================================================================
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+# Topologie multi-VM (branche multi-vm) : ce script mono-VM ne doit plus être lancé.
+# Il pourrait refonder les anciens nœuds galera2/galera3 de VM1 en SECOND cluster,
+# avec des données périmées. Utiliser scripts/deploy-multi.sh.
+if [[ -f "$P7_ROOT/docker-compose.node1.yml" && "${P7_FORCE_MONO:-0}" != 1 ]]; then
+  die "topologie multi-VM : utiliser scripts/deploy-multi.sh (P7_FORCE_MONO=1 pour forcer l'ancien mode, en connaissance de cause)"
+fi
+
 # -----------------------------------------------------------------------------
 init_env() {
   if [[ -f .env ]]; then ok ".env déjà présent (conservé)"; else cp .env.example .env; ok ".env créé"; fi
