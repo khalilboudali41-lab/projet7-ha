@@ -12,6 +12,7 @@
 #         scripts/pki.sh verify [CN]         # contrôles de la chaîne
 #         scripts/pki.sh offline             # archive chiffrée de la clé Root puis effacement
 #         scripts/pki.sh restore-root FICHIER.enc  # remet la clé Root (renouvellement intermédiaire)
+#         scripts/pki.sh rotate-pass         # nouvelles phrases de passe des clés CA (clés inchangées)
 #
 # Idempotent : ne régénère jamais une CA existante. Aucune commande sudo.
 # =============================================================================
@@ -166,6 +167,51 @@ restore_root() {
 }
 
 # -----------------------------------------------------------------------------
+# Nouvelle phrase de passe pour une clé de CA. La CLÉ ne change pas (seul son
+# chiffrement change) : la CA et tous les certificats émis restent valides.
+# Aucune phrase de passe n'est affichée. L'ancienne clé chiffrée et l'ancienne
+# phrase ne sont effacées qu'après réussite de tous les contrôles.
+rotate_pass_one() {
+  local name=$1 key=$2 pass=$3 cert=$4 data
+  [[ -f "$key" ]] || { log "$name : clé absente (hors ligne ?) – ignorée"; return 0; }
+  [[ -f "$pass" ]] || die "$name : $pass absent"
+  local nk="$key.new" np="$pass.new"
+  undo() { shred -u "$nk" "$np" 2>/dev/null || true; die "$name : $1 (aucun fichier remplacé)"; }
+
+  openssl rand -base64 32 > "$np"; chmod 600 "$np"
+  openssl pkey -in "$key" -passin "file:$pass" -aes-256-cbc -passout "file:$np" -out "$nk" 2>/dev/null \
+    || undo "déchiffrement avec la phrase actuelle impossible"
+  chmod 600 "$nk"
+
+  # Contrôles AVANT remplacement
+  grep -q 'ENCRYPTED' "$nk" || undo "nouvelle clé non chiffrée"
+  [[ "$(openssl pkey -in "$nk" -passin "file:$np" -pubout)" == "$(openssl x509 -in "$cert" -noout -pubkey)" ]] \
+    || undo "la clé rechiffrée ne correspond pas au certificat"
+  ! openssl pkey -in "$nk" -passin "file:$pass" -noout 2>/dev/null \
+    || undo "l'ancienne phrase de passe ouvre encore la nouvelle clé"
+
+  # Remplacement (les anciens fichiers restent en .old jusqu'au contrôle final)
+  mv "$key" "$key.old"; mv "$pass" "$pass.old"
+  mv "$nk" "$key";      mv "$np" "$pass"
+
+  # Contrôle fonctionnel : signature avec la clé, vérifiée avec le certificat
+  data=$(mktemp); openssl rand 64 > "$data"
+  if ! openssl dgst -sha256 -sign "$key" -passin "file:$pass" "$data" \
+       | openssl dgst -sha256 -verify <(openssl x509 -in "$cert" -noout -pubkey) -signature /dev/stdin "$data" >/dev/null; then
+    mv -f "$key.old" "$key"; mv -f "$pass.old" "$pass"; rm -f "$data"
+    die "$name : signature de contrôle invalide – anciens fichiers remis en place"
+  fi
+  rm -f "$data"
+  shred -u "$key.old" "$pass.old"
+  ok "$name : phrase de passe changée (clé et certificat inchangés, signature de contrôle OK)"
+}
+
+rotate_pass() {
+  rotate_pass_one "Root CA"          "$ROOT/private/root-ca.key"     "$ROOT/private/root-ca.pass"     "$ROOT/certs/root-ca.crt"
+  rotate_pass_one "CA intermédiaire" "$INT/private/intermediate.key" "$INT/private/intermediate.pass" "$INT/certs/intermediate.crt"
+}
+
+# -----------------------------------------------------------------------------
 cmd=${1:-all}; shift || true
 case "$cmd" in
   all)          init_root; init_intermediate; issue_server "$@"; verify "${1:-$DEFAULT_CN}" ;;
@@ -174,5 +220,6 @@ case "$cmd" in
   verify)       verify "$@" ;;
   offline)      offline ;;
   restore-root) restore_root "$@" ;;
-  *)            sed -n '3,17p' "$0"; exit 1 ;;
+  rotate-pass)  rotate_pass ;;
+  *)            sed -n '3,18p' "$0"; exit 1 ;;
 esac
