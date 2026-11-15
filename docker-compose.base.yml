@@ -1,0 +1,218 @@
+# =============================================================================
+# Projet 7 – MULTI-VM : modèles de services communs à node1 (VM1) et node2 (VM2)
+#
+# Ce fichier n'est PAS un projet à lancer : il est chargé par « extends » depuis
+# docker-compose.node1.yml et docker-compose.node2.yml, qui ajoutent ce qui est
+# propre à chaque VM (noms, IP, réseaux, volumes) et déclarent les réseaux et les
+# secrets. Le durcissement est donc écrit une seule fois pour les deux VMs.
+#
+# Topologie : VM1 et VM2 hébergent chacune une chaîne complète
+#   lb (VRRP) → web → app → dbproxy → { galera1 (VM1), galera2 (VM2) }
+# et garbd (VM3 192.168.89.137) apporte le 3e vote du quorum Galera.
+# =============================================================================
+
+# --- Durcissement commun ------------------------------------------------------
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  restart: unless-stopped
+  # Journaux centralisés vers le collecteur LOCAL de la VM (127.0.0.1:5514) ;
+  # `docker logs` reste disponible (double journalisation du démon Docker)
+  logging:
+    driver: syslog
+    options:
+      syslog-address: "udp://127.0.0.1:5514"
+      syslog-format: rfc5424micro
+      tag: "{{.Name}}"
+
+services:
+  # ===========================================================================
+  # Galera – RÉSEAU HÔTE (voir README, « Choix réseau Galera »)
+  #  - les ports 3306/4567/4568/4444 sont ceux de la VM : firewalld les filtre
+  #    réellement (le trafic ipvlan, lui, contourne le pare-feu de l'hôte) ;
+  #  - gcomm annonce l'IP réelle de la VM : pas de NAT entre nœuds.
+  # Chaque nœud précise dans son fichier node : nom, adresse d'écoute (bind-address,
+  # gmcast.listen_addr, IST, SST = IP de SA VM, jamais 0.0.0.0) et volume.
+  # Pas de « hostname » : incompatible avec network_mode host.
+  # ===========================================================================
+  galera:
+    <<: *hardening
+    image: mariadb:11.4.13-noble
+    network_mode: host
+    entrypoint: ["/usr/local/bin/galera-entrypoint.sh"]
+    # L'entrypoint officiel démarre en root puis bascule sur l'utilisateur mysql
+    # (gosu) : seules les capacités nécessaires à cette bascule sont rendues.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    environment:
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+      MARIADB_ROOT_HOST: localhost          # pas de root à distance
+      TZ: ${TZ:-Europe/Paris}
+      # 1 = ce nœud fonde le cluster (--wsrep-new-cluster). Positionné uniquement
+      # par scripts/deploy-multi.sh, JAMAIS en dur (sinon : 2 clusters divergents)
+      GALERA_BOOTSTRAP: ${GALERA_BOOTSTRAP:-0}
+    secrets: [db_root_password, db_sst_password, db_monitor_password, db_app_password, db_backup_password]
+    volumes:
+      # Configuration commune (identique à la version mono-VM) ; les paramètres
+      # multi-VM passés en ligne de commande par les fichiers node la surchargent
+      - ./db/conf/galera.cnf:/etc/mysql/conf.d/60-projet7-galera.cnf:ro,z
+      - ./db/galera-entrypoint.sh:/usr/local/bin/galera-entrypoint.sh:ro,z
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--defaults-extra-file=/etc/mysql/healthcheck-auth.cnf", "--connect", "--galera_online"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 180s                    # temps d'un SST complet
+    stop_grace_period: 60s                  # arrêt propre → grastate.dat cohérent
+    mem_limit: 512m
+
+  # ===========================================================================
+  # dbproxy – HAProxy SQL (un par VM, alias DNS « db » sur db_net)
+  # P7_MULTI_VM → haproxy.cfg vise galera1 (192.168.89.136) puis galera2 (.138)
+  # ===========================================================================
+  dbproxy:
+    <<: *hardening
+    build: ./db/dbproxy
+    image: projet7/dbproxy:3.2.26
+    read_only: true
+    tmpfs: ["/tmp:size=8m"]
+    environment:
+      P7_MULTI_VM: "1"
+      TZ: ${TZ:-Europe/Paris}
+    secrets: [db_monitor_password]
+    volumes:
+      - ./db/dbproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro,z
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'show info' | socat stdio unix-connect:/tmp/admin.sock | grep -q '^Uptime:'"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    mem_limit: 64m
+
+  # ===========================================================================
+  # app – php-fpm (image immuable, non-root)
+  # ===========================================================================
+  app:
+    <<: *hardening
+    build: ./app
+    image: projet7/vitrine-app:1.0
+    read_only: true
+    tmpfs: ["/tmp:size=16m"]
+    environment:
+      TZ: ${TZ:-Europe/Paris}
+    secrets: [db_app_password]
+    healthcheck:
+      test: ["CMD", "php", "-r", "exit(@fsockopen('127.0.0.1', 9000) ? 0 : 1);"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    mem_limit: 128m
+
+  # ===========================================================================
+  # web – nginx (non-root, lecture seule) ; ne connaît que l'app de sa VM
+  # ===========================================================================
+  web:
+    <<: *hardening
+    image: nginx:1.30.6-alpine
+    user: "101:101"
+    read_only: true
+    tmpfs: ["/tmp:size=16m"]
+    environment:
+      TZ: ${TZ:-Europe/Paris}
+    volumes:
+      - ./web/nginx-multi.conf:/etc/nginx/nginx.conf:ro,z
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/nginx-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    mem_limit: 64m
+
+  # ===========================================================================
+  # lb – HAProxy + keepalived ; VRRP unicast entre lb1 (VM1) et lb2 (VM2)
+  # ===========================================================================
+  lb:
+    <<: *hardening
+    build: ./lb
+    image: projet7/lb:3.2.26-ka2.3.4
+    environment:
+      P7_MULTI_VM: "1"
+      VIP: 192.168.89.100
+      TZ: ${TZ:-Europe/Paris}
+    # keepalived : NET_ADMIN (VIP), NET_RAW (VRRP) ; superviseur : SETUID/SETGID
+    # (bascule vers l'utilisateur haproxy), KILL (signaux à HAProxy)
+    cap_add: [NET_ADMIN, NET_RAW, SETUID, SETGID, KILL]
+    sysctls:
+      net.ipv4.ip_nonlocal_bind: 1           # BACKUP : HAProxy écoute déjà sur la VIP
+      net.ipv4.ip_unprivileged_port_start: 0 # HAProxy non-root sur 80/443
+    read_only: true
+    tmpfs: ["/tmp:size=16m", "/run:size=4m"]
+    secrets: [haproxy_pem, haproxy_users_cfg, vrrp_password]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8405/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    stop_grace_period: 10s
+    mem_limit: 128m
+
+  # ===========================================================================
+  # dns – bind9 faisant autorité pour projet7.local (ns1 VM1 .53 / ns2 VM2 .54)
+  # ===========================================================================
+  dns:
+    <<: *hardening
+    build: ./dns
+    image: projet7/dns:9.20.30
+    environment:
+      TZ: ${TZ:-Europe/Paris}
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 53   # port 53 sans root ni capacité
+    read_only: true
+    tmpfs: ["/tmp:size=8m,uid=100,gid=101"]
+    healthcheck:
+      test: ["CMD-SHELL", "[ \"$$(dig +time=2 +tries=1 +short @127.0.0.1 www.projet7.local A)\" = 192.168.89.100 ]"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    mem_limit: 64m
+
+  # ===========================================================================
+  # logcollector – rsyslog local à chaque VM (logs/ de la VM)
+  # ===========================================================================
+  logcollector:
+    <<: *hardening
+    build: ./logging
+    image: projet7/logcollector:8.2608
+    read_only: true
+    tmpfs: ["/tmp:size=16m"]
+    logging:          # pas de boucle : le collecteur journalise localement
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    volumes:
+      - ./logs:/logs:Z
+    ports:
+      - "127.0.0.1:5514:5514/udp"   # pilote syslog du démon Docker (loopback uniquement)
+    mem_limit: 64m
+
+  # ===========================================================================
+  # backup – sauvegarde logique planifiée (VM1 uniquement, voir README « Limites »)
+  # ===========================================================================
+  backup:
+    <<: *hardening
+    image: mariadb:11.4.13-noble
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"   # fichiers appartenant à l'utilisateur hôte
+    entrypoint: ["/usr/local/bin/backup.sh", "loop"]
+    read_only: true
+    tmpfs: ["/tmp:size=16m"]
+    environment:
+      TZ: ${TZ:-Europe/Paris}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-21600}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
+      # Secours (galera2, VM2) d'abord pour ne pas charger l'écrivain, puis galera1
+      BACKUP_NODES: "192.168.89.138 192.168.89.136"
+    secrets: [db_backup_password]
+    volumes:
+      - ./db/backup/backup.sh:/usr/local/bin/backup.sh:ro,z
+      - ./backups:/backups:Z
+    mem_limit: 128m

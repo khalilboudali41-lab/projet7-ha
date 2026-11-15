@@ -1,0 +1,27 @@
+# =============================================================================
+# Projet 7 – arbitre Galera (garbd) sur VM3 novyra-arbitre (192.168.89.137)
+# Installé en /etc/sysconfig/garb (root:root 0644) ; lu par /usr/sbin/garb-systemd
+# (paquet galera-26.4.27-1.el10_2, unité garb.service, alias garbd.service).
+#
+# Rôle : 3e vote du quorum. garbd ne stocke AUCUNE donnée et ne sert jamais de
+# donneur SST/IST : il participe seulement au protocole de groupe (gcomm, 4567/tcp).
+# Si VM1 ou VM2 s'éteint, le nœud restant + garbd = 2 votes sur 3 → Primary.
+#
+# Compatibilité : galera 26.4.27 ici = galera-4 26.4.27 dans mariadb:11.4.13-noble
+# (vérifié en phase 0 ; revérifié en P3 sur le cluster avant démarrage de garbd).
+# =============================================================================
+
+# Nœuds de données (galera1 sur VM1, galera2 sur VM2), séparés par des espaces
+GALERA_NODES="192.168.89.136:4567 192.168.89.138:4567"
+
+# Doit être identique à wsrep_cluster_name (db/conf/galera.cnf)
+GALERA_GROUP="projet7_galera"
+
+# gcomm n'écoute que sur l'IP de VM3 (pas sur 0.0.0.0)
+GALERA_OPTIONS="gmcast.listen_addr=tcp://192.168.89.137:4567"
+
+# Journal : vide = syslog → journald (journalctl -u garb)
+# LOG_FILE=""
+
+# Répertoire de travail (créé par systemd : StateDirectory=garb, voir le drop-in)
+WORK_DIR="/var/lib/garb"

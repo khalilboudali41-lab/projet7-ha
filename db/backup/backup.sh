@@ -13,7 +13,9 @@
 set -uo pipefail
 umask 077   # les dumps contiennent des empreintes de mots de passe
 DEST=/backups
-NODES=(172.30.30.13 172.30.30.12 172.30.30.11)
+# Nœuds interrogés dans l'ordre (secours d'abord). Multi-VM : BACKUP_NODES fourni
+# par docker-compose.node1.yml (« 192.168.89.138 192.168.89.136 »).
+read -r -a NODES <<< "${BACKUP_NODES:-172.30.30.13 172.30.30.12 172.30.30.11}"
 export MYSQL_PWD; MYSQL_PWD=$(< /run/secrets/db_backup_password)
 CLIENT=(--no-defaults --skip-ssl -u backup --connect-timeout=3)   # client mariadb
 DUMP=(--no-defaults --skip-ssl -u backup)                          # mariadb-dump

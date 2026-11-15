@@ -1,20 +1,25 @@
 ; =============================================================================
-; Zone projet7.local – Projet 7 (servie par bind9 sur 192.168.89.53)
-; Incrémenter le numéro de série (AAAAMMJJnn) à chaque modification.
+; Zone projet7.local – Projet 7
+; Multi-VM : servie À L'IDENTIQUE par ns1 (VM1, 192.168.89.53) et ns2 (VM2,
+; 192.168.89.54). Deux serveurs primaires avec le même fichier, versionné dans Git :
+; pas de transfert de zone (allow-transfer none). Incrémenter le numéro de série
+; (AAAAMMJJnn) à chaque modification et redéployer les DEUX serveurs.
 ; =============================================================================
 $ORIGIN projet7.local.
 $TTL 300
 @       IN SOA  ns1.projet7.local. hostmaster.projet7.local. (
-                2026111401 ; série
+                2026111501 ; série
                 3600       ; refresh
                 600        ; retry
                 604800     ; expire
                 300 )      ; TTL négatif
 
         IN NS   ns1.projet7.local.
+        IN NS   ns2.projet7.local.
 
 ; --- Infrastructure -----------------------------------------------------------
 ns1     IN A    192.168.89.53
+ns2     IN A    192.168.89.54
 lb1     IN A    192.168.89.101
 lb2     IN A    192.168.89.102
 

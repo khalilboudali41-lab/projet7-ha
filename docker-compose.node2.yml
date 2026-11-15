@@ -1,0 +1,160 @@
+# =============================================================================
+# Projet 7 – MULTI-VM : rôle node2 = VM2 novyra-node2 (192.168.89.138)
+#   lb2 (VRRP BACKUP, 192.168.89.102) → web2 → app2 → dbproxy2 → galera1 / galera2
+#   galera2 (réseau hôte, 192.168.89.138) · dns2 (ns2, 192.168.89.54) · logcollector
+#   (pas de db-backup : limite connue, voir README)
+# Les réseaux internes (front/app/db/log/uplink) sont propres à chaque VM : ils
+# reprennent volontairement les MÊMES adresses que sur VM1 (web 172.30.10.11,
+# app 172.30.20.11), adresses que nginx-multi.conf et lb/haproxy.cfg visent.
+# Déploiement : scripts/deploy-multi.sh. Modèles communs : docker-compose.base.yml
+# =============================================================================
+name: projet7
+
+services:
+  # --- Tier données -----------------------------------------------------------
+  galera2:
+    extends: { file: docker-compose.base.yml, service: galera }
+    container_name: galera2
+    command:
+      - mariadbd
+      - --wsrep_node_name=galera2
+      - --wsrep_node_address=192.168.89.138
+      - --bind-address=192.168.89.138
+      - --wsrep_cluster_address=gcomm://192.168.89.136,192.168.89.138,192.168.89.137
+      - --wsrep_provider_options=gcache.size=128M;gcache.recover=yes;pc.weight=1;gmcast.listen_addr=tcp://192.168.89.138:4567
+    volumes:
+      # Pas d'initdb : galera2 reçoit les données de galera1 par SST
+      - galera2_data:/var/lib/mysql
+
+  dbproxy2:
+    extends: { file: docker-compose.base.yml, service: dbproxy }
+    container_name: dbproxy2
+    hostname: dbproxy2
+    networks:
+      db_net:
+        ipv4_address: 172.30.30.21
+        aliases: [db]
+      db_uplink: { ipv4_address: 172.30.50.21 }
+
+  # --- Tier application / web -------------------------------------------------
+  app2:
+    extends: { file: docker-compose.base.yml, service: app }
+    container_name: app2
+    hostname: app2
+    networks:
+      app_net: { ipv4_address: 172.30.20.11 }
+      db_net:  { ipv4_address: 172.30.30.41 }
+
+  web2:
+    extends: { file: docker-compose.base.yml, service: web }
+    container_name: web2
+    hostname: web2
+    networks:
+      front_net: { ipv4_address: 172.30.10.11 }
+      app_net:   { ipv4_address: 172.30.20.21 }
+
+  # --- Tier LB (VRRP BACKUP) --------------------------------------------------
+  lb2:
+    extends: { file: docker-compose.base.yml, service: lb }
+    container_name: lb2
+    hostname: lb2
+    environment:
+      LB_NAME: lb2
+      LB_IP: 192.168.89.102
+      PEER_IP: 192.168.89.101          # lb1 sur VM1
+      VRRP_PRIORITY: "100"
+    networks:
+      lan:
+        ipv4_address: 192.168.89.102
+        interface_name: lan0
+        gw_priority: 100
+      front_net: { ipv4_address: 172.30.10.21 }
+      log_net:   { ipv4_address: 172.30.40.21 }
+
+  # --- DNS / journaux ---------------------------------------------------------
+  dns2:
+    extends: { file: docker-compose.base.yml, service: dns }
+    container_name: dns2
+    hostname: ns2
+    networks:
+      lan: { ipv4_address: 192.168.89.54 }
+
+  logcollector:
+    extends: { file: docker-compose.base.yml, service: logcollector }
+    container_name: logcollector
+    hostname: logcollector-vm2
+    networks:
+      log_net: { ipv4_address: 172.30.40.10 }
+
+# =============================================================================
+# Réseaux : identiques à docker-compose.node1.yml (voir commentaires détaillés)
+# =============================================================================
+networks:
+  lan:
+    driver: ipvlan
+    driver_opts: { parent: ens160, ipvlan_mode: l2 }
+    ipam:
+      config:
+        - subnet: 192.168.89.0/24
+          gateway: 192.168.89.2
+          aux_addresses:
+            windows_host: 192.168.89.1
+            shim_host: 192.168.89.99
+            vip: 192.168.89.100
+            vm1: 192.168.89.136
+            vm3_arbitre: 192.168.89.137
+            vm2: 192.168.89.138
+
+  # Trafic vers galera1 (VM1) masqué en 192.168.89.138 → filtrable sur VM1
+  db_uplink:
+    driver: bridge
+    driver_opts: { com.docker.network.bridge.name: br-p7-uplink }
+    ipam:
+      config: [{ subnet: 172.30.50.0/24 }]
+
+  log_net:
+    driver: bridge
+    driver_opts: { com.docker.network.bridge.name: br-p7-log }
+    ipam:
+      config: [{ subnet: 172.30.40.0/24 }]
+
+  front_net:
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: br-p7-front
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    ipam:
+      config: [{ subnet: 172.30.10.0/24 }]
+
+  app_net:
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: br-p7-app
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    ipam:
+      config: [{ subnet: 172.30.20.0/24 }]
+
+  db_net:
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: br-p7-db
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    ipam:
+      config: [{ subnet: 172.30.30.0/24 }]
+
+volumes:
+  galera2_data:        # = projet7_galera2_data. ATTENTION : le volume cloné depuis VM1
+                       # doit être supprimé avant la 1re jonction (SST propre) – P3
+
+secrets:
+  db_root_password:    { file: ./secrets/db_root_password }
+  db_sst_password:     { file: ./secrets/db_sst_password }
+  db_monitor_password: { file: ./secrets/db_monitor_password }
+  db_app_password:     { file: ./secrets/db_app_password }
+  db_backup_password:  { file: ./secrets/db_backup_password }
+  haproxy_pem:         { file: ./secrets/haproxy_pem }
+  haproxy_users_cfg:   { file: ./secrets/haproxy_users_cfg }
+  vrrp_password:       { file: ./secrets/vrrp_password }

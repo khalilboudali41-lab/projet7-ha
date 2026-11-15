@@ -1,0 +1,178 @@
+# =============================================================================
+# Projet 7 – MULTI-VM : rôle node1 = VM1 novyra-agent (192.168.89.136)
+#   lb1 (VRRP MASTER, 192.168.89.101) → web1 → app1 → dbproxy1 → galera1 / galera2
+#   galera1 (réseau hôte, 192.168.89.136) · dns1 (ns1, 192.168.89.53)
+#   logcollector · db-backup (VM1 uniquement)
+# Déploiement : scripts/deploy-multi.sh (jamais « up » à la main pour Galera :
+# le bootstrap est décidé par le script).
+#   docker compose -f docker-compose.node1.yml config   # contrôle de syntaxe
+# Modèles communs (durcissement, healthchecks) : docker-compose.base.yml
+# =============================================================================
+name: projet7
+
+services:
+  # --- Tier données -----------------------------------------------------------
+  galera1:
+    extends: { file: docker-compose.base.yml, service: galera }
+    container_name: galera1
+    command:
+      - mariadbd
+      - --wsrep_node_name=galera1
+      - --wsrep_node_address=192.168.89.136
+      # Écoute sur l'IP de la VM uniquement (jamais sur les bridges Docker)
+      - --bind-address=192.168.89.136
+      - --wsrep_cluster_address=gcomm://192.168.89.136,192.168.89.138,192.168.89.137
+      # Options de galera.cnf + gmcast.listen_addr (gcomm limité à l'IP de la VM)
+      - --wsrep_provider_options=gcache.size=128M;gcache.recover=yes;pc.weight=1;gmcast.listen_addr=tcp://192.168.89.136:4567
+    volumes:
+      - galera1_data:/var/lib/mysql
+      # Scripts d'initialisation : exécutés uniquement si le datadir est vide
+      # (premier déploiement : galera1 fonde le cluster et crée schéma + comptes)
+      - ./db/initdb:/docker-entrypoint-initdb.d:ro,z
+
+  dbproxy1:
+    extends: { file: docker-compose.base.yml, service: dbproxy }
+    container_name: dbproxy1
+    hostname: dbproxy1
+    networks:
+      db_net:
+        ipv4_address: 172.30.30.21
+        aliases: [db]
+      db_uplink: { ipv4_address: 172.30.50.21 }
+
+  backup:
+    extends: { file: docker-compose.base.yml, service: backup }
+    container_name: db-backup
+    hostname: db-backup
+    networks:
+      db_uplink: { ipv4_address: 172.30.50.31 }
+
+  # --- Tier application / web -------------------------------------------------
+  app1:
+    extends: { file: docker-compose.base.yml, service: app }
+    container_name: app1
+    hostname: app1
+    networks:
+      app_net: { ipv4_address: 172.30.20.11 }
+      db_net:  { ipv4_address: 172.30.30.41 }
+
+  web1:
+    extends: { file: docker-compose.base.yml, service: web }
+    container_name: web1
+    hostname: web1
+    networks:
+      front_net: { ipv4_address: 172.30.10.11 }
+      app_net:   { ipv4_address: 172.30.20.21 }
+
+  # --- Tier LB (VRRP MASTER) --------------------------------------------------
+  lb1:
+    extends: { file: docker-compose.base.yml, service: lb }
+    container_name: lb1
+    hostname: lb1
+    environment:
+      LB_NAME: lb1
+      LB_IP: 192.168.89.101
+      PEER_IP: 192.168.89.102          # lb2 sur VM2
+      VRRP_PRIORITY: "150"
+    networks:
+      lan:
+        ipv4_address: 192.168.89.101
+        interface_name: lan0
+        gw_priority: 100
+      front_net: { ipv4_address: 172.30.10.21 }
+      log_net:   { ipv4_address: 172.30.40.21 }
+
+  # --- DNS / journaux ---------------------------------------------------------
+  dns1:
+    extends: { file: docker-compose.base.yml, service: dns }
+    container_name: dns1
+    hostname: ns1
+    networks:
+      lan: { ipv4_address: 192.168.89.53 }
+
+  logcollector:
+    extends: { file: docker-compose.base.yml, service: logcollector }
+    container_name: logcollector
+    hostname: logcollector-vm1
+    networks:
+      log_net: { ipv4_address: 172.30.40.10 }
+
+# =============================================================================
+# Réseaux (identiques sur les deux VMs, sauf mention)
+# =============================================================================
+networks:
+  # LAN VMnet8 : ipvlan L2 sur ens160 – lb1 (.101) et dns1 (.53) ont leur propre IP,
+  # la VIP passe de lb1 à lb2 (MAC de la VM : pas de mode promiscuité VMware).
+  lan:
+    driver: ipvlan
+    driver_opts: { parent: ens160, ipvlan_mode: l2 }
+    ipam:
+      config:
+        - subnet: 192.168.89.0/24
+          gateway: 192.168.89.2
+          aux_addresses:          # adresses réservées (jamais attribuées par Docker)
+            windows_host: 192.168.89.1
+            shim_host: 192.168.89.99
+            vip: 192.168.89.100
+            vm1: 192.168.89.136
+            vm3_arbitre: 192.168.89.137
+            vm2: 192.168.89.138
+
+  # Sortie du tier données vers les IP des VMs (Galera en réseau hôte) : seul
+  # réseau non interne du tier données (dbproxy, backup). Le trafic vers l'autre VM
+  # sort masqué en 192.168.89.136 → filtrable par firewalld sur la VM distante.
+  db_uplink:
+    driver: bridge
+    driver_opts: { com.docker.network.bridge.name: br-p7-uplink }
+    ipam:
+      config: [{ subnet: 172.30.50.0/24 }]
+
+  # Journaux : LB → collecteur (non internal : publication 127.0.0.1:5514/udp)
+  log_net:
+    driver: bridge
+    driver_opts: { com.docker.network.bridge.name: br-p7-log }
+    ipam:
+      config: [{ subnet: 172.30.40.0/24 }]
+
+  front_net:
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: br-p7-front
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    ipam:
+      config: [{ subnet: 172.30.10.0/24 }]
+
+  app_net:
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: br-p7-app
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    ipam:
+      config: [{ subnet: 172.30.20.0/24 }]
+
+  # app → dbproxy : interne, aucune IP côté hôte
+  db_net:
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: br-p7-db
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    ipam:
+      config: [{ subnet: 172.30.30.0/24 }]
+
+volumes:
+  galera1_data:        # = projet7_galera1_data : volume existant de la version mono-VM (données conservées)
+
+# Secrets : fichiers générés depuis .env (deploy-multi.sh) et IDENTIQUES sur les
+# deux VMs (copiés par scp depuis VM1, jamais dans Git).
+secrets:
+  db_root_password:    { file: ./secrets/db_root_password }
+  db_sst_password:     { file: ./secrets/db_sst_password }
+  db_monitor_password: { file: ./secrets/db_monitor_password }
+  db_app_password:     { file: ./secrets/db_app_password }
+  db_backup_password:  { file: ./secrets/db_backup_password }
+  haproxy_pem:         { file: ./secrets/haproxy_pem }
+  haproxy_users_cfg:   { file: ./secrets/haproxy_users_cfg }
+  vrrp_password:       { file: ./secrets/vrrp_password }
