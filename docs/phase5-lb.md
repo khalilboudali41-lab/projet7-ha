@@ -13,7 +13,7 @@
        ▼
   front_net → web1/web2/web3 (leastconn, check HTTP /healthz)
   log_net   → logcollector (rsyslog) → ./logs/
- VM (hôte) ── p7-shim 192.168.89.99/32 (ipvlan, NetworkManager) ──► .53 .100 .101 .102
+ VM (hôte) ── p7-shim 192.168.89.99/32 (ipvlan, NetworkManager persistant) ──► .53 .100 .101 .102
 ```
 
 ## Pourquoi ipvlan L2 (rappel de la décision validée)
@@ -79,9 +79,21 @@ Fichier hosts + Root CA importée (cadenas valide, aucun avertissement).
 | dbproxy1 arrêté | ✅ dbproxy2 prend le relais (alias `db`) |
 | lb1 arrêté | ✅ VIP basculée sur lb2 |
 
-## Shim hôte (persistant – optionnel, non encore créé)
-Utile seulement pour joindre la VIP **depuis la VM elle-même** (le client Windows n'en a pas besoin).
-Sans shim, les scripts de test passent par un conteneur sonde sur le réseau `lan`.
+## Shim hôte persistant (VM1, créé le 17/11/2026)
+Nécessaire pour joindre la VIP, lb1/lb2 et dns **depuis la VM elle-même** (le client Windows n'en a pas besoin).
+Sans shim, les scripts de test passent par un conteneur sonde sur le réseau `lan` (192.168.89.97).
+
+**Incident du 17/11/2026** : après un redémarrage de VM1 (16:20), `curl https://192.168.89.100` depuis la VM
+renvoyait `000` alors que lb1 était MASTER et que le LAN/Windows obtenait 200. Cause : aucune connexion
+`p7-shim` n'existait (le shim n'avait jamais été rendu persistant), donc `ip route get 192.168.89.100`
+sortait par `ens160`, et l'isolation ipvlan parent ↔ slaves fait perdre ces paquets. Correction : connexion
+NetworkManager persistante ci-dessous, désormais créée de façon idempotente par `deploy-multi.sh`.
+
+```bash
+scripts/deploy-multi.sh shim     # idempotent : ne fait rien (et sans sudo) si le shim est correct
+                                 # (aussi exécuté au début de « up », non bloquant ; vérifié par « status »)
+```
+Équivalent manuel :
 ```bash
 sudo nmcli connection add type ipvlan con-name p7-shim ifname p7-shim \
   ipvlan.parent ens160 ipvlan.mode l2 \
@@ -91,6 +103,8 @@ sudo nmcli connection add type ipvlan con-name p7-shim ifname p7-shim \
   connection.autoconnect yes connection.zone public
 sudo nmcli connection up p7-shim
 ```
+Contrôle : `ip route get 192.168.89.100` → `dev p7-shim src 192.168.89.99` (les /32 l'emportent sur le /24 d'`ens160`).
+Le profil est stocké dans `/etc/NetworkManager/system-connections/p7-shim.nmconnection` et remonte au boot.
 Retrait : `sudo nmcli connection delete p7-shim`.
 
 ## Commandes

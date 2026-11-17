@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Projet 7 – déploiement MULTI-VM (sans sudo), lancé depuis VM1 (novyra-agent)
+# Projet 7 – déploiement MULTI-VM (sans sudo, sauf création du shim), lancé depuis VM1 (novyra-agent)
 #   VM1 192.168.89.136 : docker-compose.node1.yml (galera1, lb1 MASTER…)
 #   VM2 192.168.89.138 : docker-compose.node2.yml (galera2, lb2 BACKUP…), par SSH
 #   VM3 192.168.89.137 : garbd (systemd, installé par scripts/p3_garbd_vm3.sh)
@@ -10,7 +10,8 @@
 #   scripts/deploy-multi.sh galera [--bootstrap galeraN]
 #                                             # démarrage/mise à jour sûrs du cluster Galera
 #   scripts/deploy-multi.sh services          # dbproxy, app, web, dns, lb (un à un, VM2 puis VM1)
-#   scripts/deploy-multi.sh up [--bootstrap galeraN]   # sync + build + galera + services
+#   scripts/deploy-multi.sh shim              # shim hôte p7-shim (VM1 → VIP), idempotent, sudo si besoin
+#   scripts/deploy-multi.sh up [--bootstrap galeraN]   # shim + sync + build + galera + services
 #   scripts/deploy-multi.sh status            # état des 3 VMs, du cluster, de la VIP
 #   scripts/deploy-multi.sh down              # arrêt ordonné (galera1 en DERNIER), volumes conservés
 #
@@ -324,10 +325,53 @@ services_up() {
 }
 
 # =============================================================================
+# shim hôte p7-shim (VM1) : l'hôte ne peut pas joindre ses propres slaves ipvlan
+# (lb1, dns1) → slave ipvlan côté hôte + routes /32, en connexion NetworkManager
+# persistante (survit au redémarrage). Idempotent : sudo seulement si à corriger.
+# =============================================================================
+SHIM=p7-shim
+SHIM_IP=192.168.89.99
+SHIM_TARGETS=("$VIP" 192.168.89.101 192.168.89.102 192.168.89.53)
+
+shim_ok() {   # connexion persistante + active + chaque /32 routée par le shim
+  local t
+  [[ $(nmcli -g connection.autoconnect connection show "$SHIM" 2>/dev/null) == yes ]] || return 1
+  [[ $(nmcli -g GENERAL.STATE connection show "$SHIM" 2>/dev/null) == activated ]] || return 1
+  for t in "${SHIM_TARGETS[@]}"; do
+    ip route get "$t" 2>/dev/null | grep -q "dev $SHIM src $SHIM_IP" || return 1
+  done
+}
+
+# shim_ensure [strict] : crée/corrige le shim ; « strict » → échec fatal
+shim_ensure() {
+  local strict=${1:-} routes
+  if shim_ok; then ok "$SHIM actif et persistant ($SHIM_IP → ${SHIM_TARGETS[*]})"; return 0; fi
+  routes=$(printf '%s/32, ' "${SHIM_TARGETS[@]}"); routes=${routes%, }
+  log "Création/correction du shim $SHIM (NetworkManager, sudo requis)"
+  if ! { { nmcli -g connection.id connection show "$SHIM" >/dev/null 2>&1 \
+           || sudo nmcli connection add type ipvlan con-name "$SHIM" ifname "$SHIM" \
+                ipvlan.parent ens160 ipvlan.mode l2; } \
+         && sudo nmcli connection modify "$SHIM" ipvlan.parent ens160 ipvlan.mode l2 \
+              ipv4.method manual ipv4.addresses "$SHIM_IP/32" ipv4.routes "$routes" \
+              ipv4.never-default yes ipv6.method disabled \
+              connection.autoconnect yes connection.zone public \
+         && sudo nmcli connection up "$SHIM" >/dev/null \
+         && shim_ok; }; then
+    [[ -n $strict ]] && die "shim $SHIM non créé (sudo refusé ?) – voir docs/phase5-lb.md"
+    warn "shim $SHIM absent/incorrect : la VM ne joindra pas la VIP (le LAN/Windows, si) – scripts/deploy-multi.sh shim"
+    return 0
+  fi
+  ok "$SHIM créé (persistant) : $(ip route get "$VIP" | head -1)"
+}
+
+# =============================================================================
 # status
 # =============================================================================
 status_all() {
   local n g c
+  log "Shim hôte (VM1)"
+  if shim_ok; then printf '    %-8s actif, persistant, %s → %s\n' "$SHIM" "$SHIM_IP" "${SHIM_TARGETS[*]}"
+  else printf '    %-8s \e[1;33mabsent ou incorrect\e[0m – la VM ne joint pas la VIP : scripts/deploy-multi.sh shim\n' "$SHIM"; fi
   for n in node1 node2; do
     log "Conteneurs ($n – $(node_ip $n))"
     { on "$n" "docker ps -a --filter label=com.docker.compose.project=projet7 --format '{{.Names}}|{{.Status}}'" || echo "(injoignable)"; } \
@@ -397,10 +441,11 @@ main() {
     build)    build_all ;;
     galera)   galera_up "$BOOT" ;;
     services) services_up ;;
-    up)       sync_vm2; build_all; galera_up "$BOOT"; services_up; status_all ;;
+    shim)     shim_ensure strict ;;
+    up)       shim_ensure; sync_vm2; build_all; galera_up "$BOOT"; services_up; status_all ;;
     status)   status_all ;;
     down)     down_all ;;
-    *)        sed -n '3,21p' "$0"; exit 1 ;;
+    *)        sed -n '3,22p' "$0"; exit 1 ;;
   esac
 }
 

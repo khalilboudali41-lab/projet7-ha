@@ -87,7 +87,7 @@ flowchart TB
 | `dns` (ns1) | 192.168.89.53 | DNS faisant autorité pour `projet7.local` |
 | **VIP** | **192.168.89.100** | `www.projet7.local`, portée par lb1 ou lb2 |
 | `lb1` / `lb2` | 192.168.89.101 / .102 · front .21/.22 · log .21/.22 | HAProxy + Keepalived |
-| `p7-shim` (facultatif) | 192.168.89.99/32 | permet à la VM elle-même de joindre la VIP |
+| `p7-shim` (VM1, persistant) | 192.168.89.99/32 | permet à la VM elle-même de joindre la VIP, lb1/lb2 et dns |
 | `web1-3` | front 172.30.10.11-13 · app 172.30.20.21-23 | nginx 1.30.6 |
 | `app1-3` | app 172.30.20.11-13 · db 172.30.30.41-43 | php-fpm 8.4.27 |
 | `dbproxy1/2` (alias `db`) | 172.30.30.21/.22 | HAProxy TCP, un seul écrivain |
@@ -128,7 +128,7 @@ HAProxy est utilisé **deux fois** : en frontal HTTP/TLS et en proxy SQL TCP, ce
 | **ipvlan L2** ✅ | Chaque LB a **sa propre IP sur le LAN**, avec la MAC de la VM : aucun réglage VMware, et le client Windows joint directement la VIP. |
 
 Les contraintes d'ipvlan ont été traitées :
-- l'hôte ne peut pas joindre ses propres sous-interfaces ipvlan : le shim `p7-shim` est facultatif ;
+- l'hôte ne peut pas joindre ses propres sous-interfaces ipvlan : shim `p7-shim` (connexion NetworkManager persistante, créée par `deploy-multi.sh shim`) ;
 - la VIP ne peut pas exister sur deux conteneurs à la fois (`EADDRINUSE`) pendant une préemption : le script `vip-ensure.sh` réessaie l'ajout ;
 - les transitions VRRP passent par `vrrp_notify_fifo` (`vrrp-notify.sh`) : traitées dans l'ordre, elles ne peuvent plus laisser la VIP sur un nœud revenu en BACKUP.
 
@@ -216,7 +216,7 @@ Comportement :
 - **les mises à jour sont tournantes**, un conteneur à la fois, en attendant qu'il soit sain : 267/267 requêtes réussies pendant la mise à jour de 11 conteneurs ;
 - **démarrage de Galera** : après un arrêt propre ou un crash total, le nœud le plus avancé est choisi automatiquement (`safe_to_bootstrap`, sinon `wsrep-recover`).
 
-Facultatif, pour que la VM elle-même joigne la VIP : créer le shim NetworkManager persistant (commande expliquée dans [docs/phase5-lb.md](docs/phase5-lb.md#shim-hôte-persistant--optionnel-non-encore-créé)).
+Pour que la VM elle-même joigne la VIP : shim NetworkManager persistant `p7-shim`, créé de façon idempotente par `scripts/deploy-multi.sh shim` (aussi lancé par `up`, contrôlé par `status`). Sans lui, après un redémarrage, `curl` vers la VIP depuis la VM renvoie `000` alors que Windows fonctionne. Détails : [docs/phase5-lb.md](docs/phase5-lb.md#shim-hôte-persistant-vm1-créé-le-17112026).
 
 ### Côté client Windows
 1. **Importer la Root CA**. Vérifier d'abord l'empreinte SHA-256 `E9:C5:4A:C6:…:AD:23:A4:EA`, puis, dans un PowerShell administrateur :
