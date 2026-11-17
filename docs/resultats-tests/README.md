@@ -19,3 +19,5 @@ Généré automatiquement par `scripts/test_failover_*.sh` (le plus récent en b
 | 14/11/2026 15:41:14 | lb | docker kill lb1 (HAProxy + keepalived du MASTER tués, sans libération propre de la VIP) | 3.6 s | 3 / 217 | ✅ RÉUSSI | [20261114-154114_lb.md](20261114-154114_lb.md) |
 | 14/11/2026 15:43:24 | web | docker kill web1 web2 (arrêt brutal, SIGKILL) | 0.0 s | 0 / 207 | ✅ RÉUSSI | [20261114-154324_web.md](20261114-154324_web.md) |
 | 14/11/2026 15:44:13 | web | docker kill web1 web2 (arrêt brutal, SIGKILL) | 0.0 s | 0 / 205 | ✅ RÉUSSI | [20261114-154413_web.md](20261114-154413_web.md) |
+| 15/11/2026 23:13:40 | vm-smoke | aucune (validation de la mesure) | 0.0 s | 0 / 162 | ✅ RÉUSSI | [20261115-231340_vm-smoke.md](20261115-231340_vm-smoke.md) |
+| 17/11/2026 15:18:48 | vm-smoke | aucune (validation de la mesure) | 0.0 s | 0 / 162 | ✅ RÉUSSI | [20261117-151848_vm-smoke.md](20261117-151848_vm-smoke.md) |
