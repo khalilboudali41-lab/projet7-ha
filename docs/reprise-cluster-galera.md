@@ -156,3 +156,43 @@ HTTP 200 via la VIP depuis VM3, et le compteur passe de 5570 à 5571.
 - **Le collecteur de journaux s'arrête en même temps que la VM.** Les dernières secondes avant
   l'arrêt ne sont donc pas dans `logs/` : elles n'ont été retrouvées que dans `docker logs`
   des conteneurs qui n'avaient pas été recréés.
+
+## 8. Version multi-VM : reprise après l'arrêt des deux VMs (17/11/2026)
+
+Situation : VM1 et VM2 éteintes le 15/11 sans arrêt propre de Galera. Au redémarrage,
+galera1 et galera2 bouclent (`failed to reach primary view`), garbd (VM3) redémarre lui
+aussi faute de composant primaire à rejoindre.
+
+| Nœud | grastate.dat | `--wsrep-recover` | Compteur | Visites (max id, dernière) |
+|---|---|---|---|---|
+| galera1 (VM1) | `98aa2a13…:-1`, safe 0 | `98aa2a13-e122-11f1-bf46-7ad5f8c5a60d:1200` | 6736 | 6736 (19966, 15/11 23:18:25) |
+| galera2 (VM2) | `98aa2a13…:-1`, safe 0 | `98aa2a13-e122-11f1-bf46-7ad5f8c5a60d:1406` | 6941 | 6941 (20375, 15/11 23:19:15) |
+
+Même historique, galera2 en avance de 206 transactions (205 visites) : galera1 a perdu
+le quorum ~50 s avant galera2. Fondateur validé par l'opérateur : **galera2**. Après
+reprise : `wsrep_cluster_size 3` (galera1 + galera2 + garbd), compteur 6941 sur les deux
+nœuds (aucun recul), galera1 resynchronisé par SST.
+
+Remarque : le fondateur démarrant avec `seqno: -1` dans `grastate.dat`, le cluster a
+reçu un **nouvel UUID** d'historique (`38140729…`) ; galera1 a donc fait un SST complet
+et non un IST. Sans conséquence sur les données.
+
+**Procédure (depuis VM1) :**
+
+```bash
+scripts/deploy-multi.sh up        # ou : scripts/deploy-multi.sh galera
+```
+
+`galera_up` gère désormais ce cas :
+1. nœud(s) lancé(s) sans aucun `Primary` → affichés (état wsrep, nombre de redémarrages)
+   puis **arrêtés** (sinon chaque tour de boucle réécrit `grastate.dat`) ; si un nœud est
+   `Primary` sans être `Synced` (SST en cours), le script s'arrête sans rien toucher ;
+2. copie à froid de chaque volume (`backups/galeraN-vol-avant-bootstrap-*.tgz`, sur sa VM) ;
+3. `grastate.dat`, puis `--wsrep-recover` si `seqno: -1` ;
+4. tableau de décision : position + compteur et visites lus sur la **copie** à froid ;
+5. fondateur **proposé** (seqno le plus haut ; galera1 par défaut en cas d'égalité) et
+   **confirmé** en tapant son nom. Sans terminal : arrêt, relancer avec `--bootstrap galeraN`.
+   UUID nul ou différents : arrêt, `--bootstrap` obligatoire après comparaison.
+
+Pas de confirmation après un `deploy-multi.sh down` (le dernier nœud arrêté porte
+`safe_to_bootstrap: 1`) ni au premier déploiement.

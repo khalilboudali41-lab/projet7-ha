@@ -17,7 +17,8 @@
 # Options : --force-recreate (services : recrée même sans changement de config,
 #           utile après modification d'un fichier monté : nginx-multi.conf…)
 # Galera n'est JAMAIS fondé automatiquement en cas de doute (voir
-# docs/reprise-cluster-galera.md) : le script s'arrête et demande --bootstrap.
+# docs/reprise-cluster-galera.md) : nœuds lancés sans Primary → arrêtés, positions
+# et données comparées, fondateur PROPOSÉ et confirmé par l'opérateur (ou --bootstrap).
 # =============================================================================
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib_secrets.sh"
@@ -136,7 +137,45 @@ cold_copy() {
   local g=$1 n ts; n=$(node_of "$1"); ts=$(date +%Y%m%d-%H%M%S)
   on "$n" "install -d -m 700 backups && docker run --rm --network none -v projet7_${g}_data:/src:ro alpine:3.24.4 \
     tar czf - -C /src . > backups/${g}-vol-avant-bootstrap-$ts.tgz && chmod 600 backups/${g}-vol-avant-bootstrap-$ts.tgz"
-  ok "Copie à froid : $n:backups/${g}-vol-avant-bootstrap-$ts.tgz"
+  COPY[$g]=backups/${g}-vol-avant-bootstrap-$ts.tgz
+  ok "Copie à froid : $n:${COPY[$g]}"
+}
+declare -gA COPY=()
+
+# Données applicatives lues sur la COPIE à froid (volume temporaire, jamais le
+# volume réel) → "compteur N, visites N (max id N, dernière AAAA-MM-JJ hh:mm:ss)"
+data_of() {
+  local g=$1 n v sql inner; n=$(node_of "$g"); v=p7-recover-$g-$$
+  [[ -n "${COPY[$g]:-}" ]] || { echo "(pas de copie)"; return 0; }
+  sql="SELECT (SELECT valeur FROM vitrine.compteur LIMIT 1), COUNT(*), MAX(id), LEFT(MAX(horodatage),19) FROM vitrine.visites"
+  inner="gosu mysql mariadbd --wsrep_on=OFF --skip-networking --skip-grant-tables >/dev/null 2>&1 &
+    for i in \$(seq 60); do mariadb -e 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; done
+    mariadb -N -B -e $(printf %q "$sql")"
+  on "$n" "docker volume create $v >/dev/null \
+    && docker run --rm -i --network none -v $v:/dst alpine:3.24.4 tar xzf - -C /dst < ${COPY[$g]} \
+    && docker run --rm --network none -v $v:/var/lib/mysql --entrypoint bash $GALERA_IMAGE -c $(printf %q "$inner"); \
+    docker volume rm $v >/dev/null 2>&1" 2>/dev/null \
+  | awk -F'\t' 'NF>=4{printf "compteur %s, visites %s (max id %s, dernière %s)", $1, $2, $3, $4; f=1} END{if(!f) printf "(données illisibles)"}'
+}
+
+# Tableau de décision : grastate, position récupérée, données (copie à froid)
+show_positions() {
+  local g
+  for g in galera1 galera2; do
+    printf '    %-8s grastate %-50s position %-48s %s\n' "$g" "${st[$g]:-?}" "${pos[$g]:-${st[$g]:-?}}" \
+      "$([[ "${st[$g]:-}" == NEW ]] && echo "(volume vide)" || data_of "$g")"
+  done
+}
+
+# Confirmation explicite : taper le nom du nœud (pas de « o/N » validé par réflexe).
+# Sans terminal (CI, nohup…) : arrêt, l'opérateur relance avec --bootstrap.
+confirm_founder() {
+  local b=$1 ans
+  [[ -t 0 ]] || die "confirmation requise mais pas de terminal : après vérification, relancer avec --bootstrap $b"
+  warn "Le fondateur impose son état au cluster : les transactions absentes de $b seront PERDUES sur l'autre nœud"
+  read -r -p "    Fonder le cluster sur $b ? Taper « $b » pour confirmer (autre réponse = abandon) : " ans
+  [[ "$ans" == "$b" ]] || die "abandon par l'opérateur : rien n'a été démarré (copies à froid conservées)"
+  ok "Fondateur confirmé par l'opérateur : $b"
 }
 
 garbd_check() {
@@ -152,11 +191,14 @@ start_member() {   # nœud ordinaire (jamais --wsrep-new-cluster)
 }
 
 galera_up() {
-  local forced=${1:-} g running=() synced=""
+  local forced=${1:-} g running=() synced="" primary="" confirm="" gs
+  declare -A gst=()
   garbd_check
   for g in galera1 galera2; do
     if [[ "$(on "$(node_of $g)" "docker inspect -f '{{.State.Running}}' $g 2>/dev/null")" == true ]]; then
-      running+=("$g"); [[ "$(gstate $g)" == "Synced Primary"* ]] && synced=$g
+      running+=("$g"); gs=$(gstate $g); gst[$g]=$gs
+      [[ "$gs" == "Synced Primary"* ]] && synced=$g
+      [[ "$gs" == *" Primary "* ]] && primary=$g
     fi
   done
 
@@ -171,10 +213,31 @@ galera_up() {
     start_member "$synced"     # recréé seulement si sa configuration a changé
     return
   fi
-  [[ ${#running[@]} -eq 0 ]] || die "nœud(s) lancé(s) mais aucun Synced/Primary (${running[*]}) : intervention manuelle (docs/reprise-cluster-galera.md)"
+  # Un composant primaire existe mais aucun nœud n'est encore Synced (SST/IST en
+  # cours) : le cluster est VIVANT, ne surtout rien arrêter
+  [[ -z "$primary" ]] || die "$primary est Primary mais pas Synced (${gst[$primary]}) : transfert d'état en cours, relancer dans quelques minutes"
+
+  # --- Cas 1 bis : nœuds lancés SANS composant primaire (reprise après arrêt des
+  # deux VMs) : ils bouclent (failed to reach primary view) et réécrivent
+  # grastate.dat à chaque tour → arrêt, puis choix du fondateur CONFIRMÉ (cas 2)
+  if [[ ${#running[@]} -gt 0 ]]; then
+    warn "Nœud(s) lancé(s) sans composant primaire : ${running[*]}"
+    for g in "${running[@]}"; do
+      printf '    %-8s %s, %s redémarrage(s)\n' "$g" "${gst[$g]}" \
+        "$(on "$(node_of $g)" "docker inspect -f '{{.RestartCount}}' $g" 2>/dev/null || echo ?)"
+    done
+    log "Arrêt de ${running[*]} (fin de la boucle de redémarrage) avant comparaison des positions"
+    for g in "${running[@]}"; do dc "$(node_of $g)" "stop $g" >/dev/null 2>&1 || true; done
+    for g in "${running[@]}"; do
+      [[ "$(on "$(node_of $g)" "docker inspect -f '{{.State.Running}}' $g 2>/dev/null")" != true ]] \
+        || die "$g refuse de s'arrêter : intervention manuelle"
+      ok "$g arrêté"
+    done
+    confirm=1
+  fi
 
   # --- Cas 2 : cluster entièrement arrêté → choix du fondateur ---------------------
-  declare -A st pos
+  declare -A st=() pos=()
   local boot="" u1 s1 b1 u2 s2 b2 z=00000000-0000-0000-0000-000000000000
   for g in galera1 galera2; do st[$g]=$(grastate_of $g); log "grastate $g : ${st[$g]}"; done
   # Copie à froid AVANT toute écriture (wsrep-recover ouvre InnoDB, le bootstrap écrit)
@@ -207,16 +270,23 @@ galera_up() {
         if [[ -z "$u1" || -z "$u2" || "$u1" == "$z" || "$u2" == "$z" || "$u1" != "$u2" \
               || ! "$s1" =~ ^[0-9]+$ || ! "$s2" =~ ^[0-9]+$ ]]; then
           fail "Choix du fondateur AMBIGU : galera1=${pos[galera1]} galera2=${pos[galera2]}"
-          echo "    (UUID nul ou différents, ou position inconnue). Comparer les données (docs/reprise-cluster-galera.md §6)"
-          echo "    puis relancer : scripts/deploy-multi.sh galera --bootstrap galera1|galera2"
+          echo "    (UUID nul ou différents, ou position inconnue). Données lues sur les copies à froid :"
+          show_positions
+          echo "    Après vérification (docs/reprise-cluster-galera.md §6), relancer :"
+          echo "    scripts/deploy-multi.sh galera --bootstrap galera1|galera2"
           exit 1
         fi
         if   (( s1 > s2 )); then boot=galera1
         elif (( s2 > s1 )); then boot=galera2
-        else boot=galera1; log "Positions identiques ($u1:$s1) : même historique, galera1 retenu"; fi
+        else boot=galera1; warn "Positions identiques ($u1:$s1) : même historique, galera1 proposé par défaut"; fi
+        confirm=1      # décision tirée des seqno après un arrêt brutal : l'opérateur valide
       fi
     fi
-    log "Fondateur : $boot"
+    log "Fondateur proposé : $boot"
+    if [[ -n "$confirm" ]]; then
+      show_positions
+      confirm_founder "$boot"
+    fi
   fi
 
   local bn other; bn=$(node_of "$boot"); [[ $boot == galera1 ]] && other=galera2 || other=galera1
@@ -265,15 +335,25 @@ status_all() {
   done
   log "Galera"
   for g in galera1 galera2; do printf '    %-8s %s\n' "$g" "$(gstate $g)"; done
-  printf '    %-8s %s\n' garbd "$(on vm3 'systemctl is-active garb' 2>/dev/null || echo injoignable)"
+  local gb; gb=$(on vm3 'systemctl is-active garb' 2>/dev/null) || true   # « activating » sort en code ≠ 0
+  printf '    %-8s %s\n' garbd "${gb:-injoignable}"
   # (taille 3 = galera1 + galera2 + garbd ; le compte monitor ne lit pas mysql.wsrep_cluster_members)
+  # VIP posée sur l'interface ET état keepalived réel (/run/keepalived/state, écrit
+  # par vrrp-notify.sh) : une VIP sur un nœud BACKUP est ORPHELINE (incident 17/11)
   log "VIP $VIP"
+  local holders=0 masters=0 vip ks
   for n in node1 node2; do
     c=lb${n#node}
-    if on "$n" "docker exec $c ip -4 -o addr show dev lan0" 2>/dev/null | grep -q " $VIP/"; then
-      printf '    %-4s (%s) MASTER – détient la VIP\n' "$c" "$n"
-    else printf '    %-4s (%s) %s\n' "$c" "$n" "$(state_of $n $c | sed 's/healthy/BACKUP/')"; fi
+    vip=""; on "$n" "docker exec $c ip -4 -o addr show dev lan0" 2>/dev/null | grep -q " $VIP/" && vip=1
+    ks=$(on "$n" "docker exec $c cat /run/keepalived/state" 2>/dev/null | cut -d' ' -f1)
+    [[ -n $vip ]] && holders=$((holders+1)); [[ $ks == MASTER ]] && masters=$((masters+1))
+    if   [[ -n $vip && ( $ks == MASTER || -z $ks ) ]]; then printf '    %-4s (%s) MASTER – détient la VIP\n' "$c" "$n"
+    elif [[ -n $vip ]]; then printf '    %-4s (%s) \e[1;31mVIP ORPHELINE\e[0m (keepalived : %s) – docker exec %s ip addr del %s/24 dev lan0\n' "$c" "$n" "$ks" "$c" "$VIP"
+    elif [[ $ks == MASTER ]]; then printf '    %-4s (%s) \e[1;33mMASTER sans VIP\e[0m\n' "$c" "$n"
+    else printf '    %-4s (%s) %s\n' "$c" "$n" "${ks:-$(state_of $n $c | sed 's/healthy/BACKUP/')}"; fi
   done
+  (( masters > 1 )) && fail "split-brain VRRP : lb1 et lb2 sont MASTER (annonces VRRP perdues ? tcpdump 'ip proto 112' sur lan0)"
+  (( holders > 1 )) && fail "VIP portée par les DEUX LB : conflit ARP sur $VIP"
   log "LB : serveurs web / dbproxy : nœuds Galera"
   for n in node1 node2; do
     on "$n" "docker exec -u haproxy lb${n#node} sh -c \"echo 'show stat' | socat stdio unix-connect:/tmp/admin.sock\"" 2>/dev/null \

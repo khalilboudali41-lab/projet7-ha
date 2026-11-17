@@ -19,6 +19,8 @@ sed -e "s/@LB_NAME@/$LB_NAME/g" -e "s/@LB_IP@/$LB_IP/g" -e "s/@PEER_IP@/$PEER_IP
     -e "s/@PRIORITY@/$VRRP_PRIORITY/g" -e "s|@VIP@|$VIP|g" -e "s/@VRRP_PASS@/$VRRP_PASS/g" \
     -e "s/@TRACK_DB@/${P7_MULTI_VM:+chk_db_path}/" \
     /etc/keepalived/keepalived.conf.tmpl > /tmp/keepalived.conf
+# FIFO des transitions VRRP + état courant (vrrp-notify.sh), accessibles à root seul
+install -d -m 700 /run/keepalived
 
 CFG="-f /usr/local/etc/haproxy/haproxy.cfg -f /run/secrets/haproxy_users_cfg"
 su-exec haproxy haproxy -c -q $CFG || { log "configuration HAProxy invalide"; exit 1; }
@@ -34,6 +36,7 @@ KP=$!
 stop() {
   log "arrêt : keepalived d'abord (libère la VIP, annonce priorité 0), puis HAProxy"
   kill -TERM "$KP" 2>/dev/null || true; wait "$KP" 2>/dev/null || true
+  echo "STOPPED 0 $(date +%s)" > /run/keepalived/state 2>/dev/null || true
   kill -USR1 "$HP" 2>/dev/null || true     # HAProxy : arrêt doux (soft-stop)
   sleep 1; kill -TERM "$HP" 2>/dev/null || true; wait "$HP" 2>/dev/null || true
 }

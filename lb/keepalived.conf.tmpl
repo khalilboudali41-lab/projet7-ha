@@ -10,6 +10,11 @@ global_defs {
     script_user haproxy
     vrrp_garp_master_delay 1
     vrrp_garp_master_repeat 3
+    # Transitions sérialisées dans l'ordre (voir vrrp-notify.sh) : remplace
+    # notify_master, dont l'exécution asynchrone pouvait reposer la VIP sur un
+    # nœud déjà revenu en BACKUP (VIP orpheline, incident du 17/11)
+    vrrp_notify_fifo /run/keepalived/notify.fifo root
+    vrrp_notify_fifo_script "/usr/local/bin/vrrp-notify.sh @VIP@ lan0" root
 }
 
 # HAProxy doit répondre réellement (pas seulement exister) : page de supervision locale
@@ -58,6 +63,4 @@ vrrp_instance VI_PROJET7 {
         chk_haproxy
         @TRACK_DB@
     }
-    # ipvlan : réessaie la pose de la VIP pendant que l'ancien MASTER la libère
-    notify_master "/usr/local/bin/vip-ensure.sh @VIP@ lan0" root
 }

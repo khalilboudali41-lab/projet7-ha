@@ -23,7 +23,8 @@
 - Conséquences gérées :
   1. le noyau isole l'hôte de ses propres slaves ipvlan → **shim** `p7-shim` (slave ipvlan côté hôte) ;
   2. le trafic vers la VIP n'entre pas dans la pile IP de l'hôte → firewalld de l'hôte ne le voit pas ; la surface exposée = sockets HAProxy (80, 443, 8404) uniquement ;
-  3. ipvlan refuse une même adresse sur deux slaves (`EADDRINUSE`) → lors d'une préemption, keepalived échouait à poser la VIP (`Netlink: error: Address in use(98)`) : corrigé par `vip-ensure.sh` (notify_master, réessai 100 ms × 50).
+  3. ipvlan refuse une même adresse sur deux slaves (`EADDRINUSE`) → lors d'une préemption, keepalived échouait à poser la VIP (`Netlink: error: Address in use(98)`) : corrigé par `vip-ensure.sh` (réessai 100 ms × 50) ;
+  4. **VIP orpheline (17/11/2026)** : `notify_master` est asynchrone. Sur une bascule MASTER→BACKUP dans la même milliseconde (VMs figées 13 s puis reprise), `vip-ensure.sh` s'exécutait **après** le retrait de la VIP par keepalived et la reposait : lb2 restait BACKUP pour keepalived mais portait la VIP (conflit ARP, « deux MASTER » dans `status`). Corrigé par `vrrp_notify_fifo` + `vrrp-notify.sh` : les transitions sont traitées **dans l'ordre** par un processus unique (MASTER → pose la VIP, tout autre état → la retire), et l'état réel est écrit dans `/run/keepalived/state`, que `deploy-multi.sh status` confronte à la présence de la VIP (`VIP ORPHELINE`, `split-brain`).
 
 ## Pourquoi HAProxy (plutôt que Nginx ou Traefik)
 | Critère | HAProxy | Nginx (OSS) | Traefik |

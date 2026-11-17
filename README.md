@@ -129,7 +129,8 @@ HAProxy est utilisé **deux fois** : en frontal HTTP/TLS et en proxy SQL TCP, ce
 
 Les contraintes d'ipvlan ont été traitées :
 - l'hôte ne peut pas joindre ses propres sous-interfaces ipvlan : le shim `p7-shim` est facultatif ;
-- la VIP ne peut pas exister sur deux conteneurs à la fois (`EADDRINUSE`) pendant une préemption : le script `vip-ensure.sh` réessaie l'ajout.
+- la VIP ne peut pas exister sur deux conteneurs à la fois (`EADDRINUSE`) pendant une préemption : le script `vip-ensure.sh` réessaie l'ajout ;
+- les transitions VRRP passent par `vrrp_notify_fifo` (`vrrp-notify.sh`) : traitées dans l'ordre, elles ne peuvent plus laisser la VIP sur un nœud revenu en BACKUP.
 
 Réglages VRRP :
 - **unicast** entre .101 et .102 (pas de multicast sur le vSwitch) ;
@@ -302,7 +303,7 @@ Le détail par phase se trouve dans les fichiers `docs/phaseN-*.md`.
 ```
 docker-compose.yml        16 services, 5 réseaux, secrets fichiers
 .env.example              modèle des secrets (le .env réel n'est jamais versionné)
-lb/                       HAProxy + Keepalived (haproxy.cfg, keepalived.conf.tmpl, superviseur, vip-ensure.sh)
+lb/                       HAProxy + Keepalived (haproxy.cfg, keepalived.conf.tmpl, superviseur, vrrp-notify.sh, vip-ensure.sh)
 web/nginx.conf            tier web
 app/                      image php-fpm + appli « vitrine HA » (src/index.php)
 db/                       galera.cnf, entrypoint, initdb, dbproxy/, backup/

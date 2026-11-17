@@ -1,6 +1,6 @@
 #!/bin/sh
 # =============================================================================
-# keepalived notify_master (exécuté en root) – garantit que la VIP est posée.
+# Appelé par vrrp-notify.sh sur MASTER (root) – garantit que la VIP est posée.
 # Particularité ipvlan : le noyau refuse qu'une même adresse soit portée par
 # deux interfaces ipvlan du même parent (EADDRINUSE). Lors d'une préemption,
 # le nouveau MASTER tente d'ajouter la VIP quelques millisecondes AVANT que
